@@ -603,7 +603,15 @@ class IntelligentDecisionEngine:
                 "dalfox": 0.93,  # High for XSS detection
                 "anew": 0.7,  # Utility tool
                 "qsreplace": 0.75,  # Utility tool
-                "uro": 0.7  # Utility tool
+                "uro": 0.7,  # Utility tool
+                "xsser": 0.92,  # XSS vulnerability scanner
+                "dotdotpwn": 0.88,  # Path traversal fuzzer
+                "hakrawler": 0.87,  # Web crawler
+                "httpie": 0.8,  # HTTP client
+                "graphql-scanner": 0.91,  # GraphQL vulnerability scanner
+                "jwt-analyzer": 0.89,  # JWT token analyzer
+                "api-schema-analyzer": 0.85,  # OpenAPI spec analyzer
+                "searchsploit": 0.75  # Exploit database search
             },
             TargetType.NETWORK_HOST.value: {
                 "nmap": 0.95,
@@ -631,7 +639,11 @@ class IntelligentDecisionEngine:
                 "x8": 0.92,  # Excellent for hidden parameters
                 "katana": 0.85,  # Good for API endpoint discovery
                 "jaeles": 0.88,
-                "postman": 0.8
+                "postman": 0.8,
+                "httpie": 0.88,  # HTTP client for API testing
+                "api-schema-analyzer": 0.92,  # OpenAPI/Swagger analyzer
+                "graphql-scanner": 0.93,  # GraphQL introspection scanner
+                "jwt-analyzer": 0.91  # JWT vulnerability analyzer
             },
             TargetType.CLOUD_SERVICE.value: {
                 "prowler": 0.95,  # Excellent for AWS security assessment
@@ -1903,6 +1915,29 @@ class IntelligentErrorHandler:
 
             # XSS testing alternatives
             "dalfox": ["xsser", "xsstrike"],
+            "xsser": ["dalfox", "xsstrike"],
+
+            # Path traversal alternatives
+            "dotdotpwn": ["ffuf", "wfuzz"],
+
+            # Web crawling custom tools
+            "hakrawler": ["katana", "gau", "waybackurls"],
+
+            # JWT analysis alternatives
+            "jwt-analyzer": ["jwt-tool", "jwt-cracker"],
+
+            # GraphQL alternatives
+            "graphql-scanner": ["graphql-voyager", "nuclei"],
+
+            # API analysis alternatives
+            "api-schema-analyzer": ["postman", "insomnia"],
+
+            # Exploit search alternatives
+            "searchsploit": ["exploit-db"],
+
+            # OSINT alternatives
+            "sherlock": ["social-analyzer"],
+            "theharvester": ["recon-ng", "amass"],
 
             # Subdomain enumeration alternatives
             "subfinder": ["amass", "assetfinder", "findomain"],
@@ -3507,6 +3542,13 @@ class CTFToolManager:
             "wpscan": "wpscan --url {} --enumerate ap,at,cb,dbe",
             "nikto": "nikto -h {} -C all",
             "whatweb": "whatweb -v -a 3",
+            "xsser": "xsser -u {} --payloads basic waf_bypass",
+            "dotdotpwn": "dotdotpwn -u {} --depth 8",
+            "hakrawler": "hakrawler -u {} -d 3 --js",
+            "qsreplace": "qsreplace FUZZ",
+            "uro": "uro --filter hasparams",
+            "httpie": "httpie GET {}",
+            "searchsploit": "searchsploit {}",
 
             # Cryptography Challenge Tools
             "hashcat": "hashcat -m 0 -a 0 --potfile-disable --quiet",
@@ -3642,6 +3684,9 @@ class CTFToolManager:
             "compress": "uncompress",
 
             # Modern Web Technologies
+            "jwt-analyzer": "jwt-analyzer {}",
+            "graphql-scanner": "graphql-scanner -u {}",
+            "api-schema-analyzer": "api-schema-analyzer {}",
             "jwt-tool": "python3 /opt/jwt_tool/jwt_tool.py",
             "jwt-cracker": "jwt-cracker",
             "graphql-voyager": "graphql-voyager",
@@ -3671,8 +3716,8 @@ class CTFToolManager:
 
         # Tool categories for intelligent selection
         self.tool_categories = {
-            "web_recon": ["httpx", "katana", "waybackurls", "gau", "whatweb"],
-            "web_vuln": ["sqlmap", "dalfox", "nikto", "wpscan"],
+            "web_recon": ["httpx", "katana", "waybackurls", "gau", "whatweb", "hakrawler", "qsreplace", "uro"],
+            "web_vuln": ["sqlmap", "dalfox", "nikto", "wpscan", "xsser", "dotdotpwn", "graphql-scanner", "jwt-analyzer"],
             "web_discovery": ["gobuster", "dirsearch", "feroxbuster"],
             "web_params": ["arjun", "paramspider"],
             "crypto_hash": ["hashcat", "john", "hash-identifier", "hashid"],
@@ -3695,7 +3740,9 @@ class CTFToolManager:
             "osint_search": ["shodan", "censys", "recon-ng"],
             "misc_encoding": ["base64", "base32", "hex", "rot13"],
             "misc_compression": ["zip", "7zip", "rar", "tar"],
-            "misc_esoteric": ["brainfuck", "whitespace", "piet", "malbolge"]
+            "misc_esoteric": ["brainfuck", "whitespace", "piet", "malbolge"],
+            "api_testing": ["httpie", "api-schema-analyzer", "graphql-scanner", "jwt-analyzer"],
+            "exploit_search": ["searchsploit"]
         }
 
     def get_tool_command(self, tool: str, target: str, additional_args: str = "") -> str:

@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""paramspider - Extract URLs with parameters from web archives."""
+
+import sys
+import json
+import argparse
+import re
+import requests
+from urllib.parse import urlparse, parse_qs, urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+warnings.filterwarnings('ignore')
+
+ARCHIVE_APIS = {
+    'wayback': 'https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&fl=original&collapse=urlkey',
+    'otx': 'https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list?limit=500',
+    'urlscan': 'https://urlscan.io/api/v1/search/?q=domain:{domain}&size=100',
+}
+
+JUNK_EXTENSIONS = {
+    '.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico',
+    '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.pdf', '.zip',
+    '.gz', '.rar', '.map', '.webp', '.bmp', '.tiff',
+}
+
+
+def fetch_wayback(domain):
+    """Fetch URLs from Wayback Machine."""
+    urls = set()
+    try:
+        url = ARCHIVE_APIS['wayback'].format(domain=domain)
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            for row in data[1:]:  # Skip header row
+                if row and row[0]:
+                    urls.add(row[0])
+    except Exception as e:
+        print(f"[!] Wayback error: {e}", file=sys.stderr)
+    return urls
+
+
+def fetch_otx(domain):
+    """Fetch URLs from AlienVault OTX."""
+    urls = set()
+    try:
+        url = ARCHIVE_APIS['otx'].format(domain=domain)
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            for entry in data.get('url_list', []):
+                if entry.get('url'):
+                    urls.add(entry['url'])
+    except Exception as e:
+        print(f"[!] OTX error: {e}", file=sys.stderr)
+    return urls
+
+
+def fetch_urlscan(domain):
+    """Fetch URLs from URLScan.io."""
+    urls = set()
+    try:
+        url = ARCHIVE_APIS['urlscan'].format(domain=domain)
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            for result in data.get('results', []):
+                page_url = result.get('page', {}).get('url', '')
+                if page_url:
+                    urls.add(page_url)
+    except Exception as e:
+        print(f"[!] URLScan error: {e}", file=sys.stderr)
+    return urls
+
+
+def has_params(url):
+    """Check if URL has query parameters."""
+    return '?' in url and '=' in url
+
+
+def is_junk(url):
+    """Check if URL is a static resource."""
+    parsed = urlparse(url)
+    path_lower = parsed.path.lower()
+    return any(path_lower.endswith(ext) for ext in JUNK_EXTENSIONS)
+
+
+def extract_params(url):
+    """Extract parameter names from URL."""
+    parsed = urlparse(url)
+    return sorted(parse_qs(parsed.query, keep_blank_values=True).keys())
+
+
+def deduplicate_by_params(urls):
+    """Deduplicate URLs by unique parameter combinations per path."""
+    seen = set()
+    unique = []
+    for url in urls:
+        parsed = urlparse(url)
+        params = tuple(sorted(parse_qs(parsed.query, keep_blank_values=True).keys()))
+        key = f"{parsed.netloc}{parsed.path}?{'&'.join(params)}"
+        if key not in seen:
+            seen.add(key)
+            unique.append(url)
+    return unique
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Extract URLs with parameters from web archives',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  paramspider -d example.com\n'
+               '  paramspider -d example.com --subs\n'
+               '  paramspider -d example.com -o params.txt\n'
+               '  paramspider -d example.com --exclude .jpg,.png'
+    )
+    parser.add_argument('-d', '--domain', required=True, help='Target domain')
+    parser.add_argument('--subs', action='store_true', help='Include subdomains')
+    parser.add_argument('-o', '--output', help='Output file')
+    parser.add_argument('--exclude', help='Comma-separated extensions to exclude')
+    parser.add_argument('--placeholder', default='FUZZ', help='Placeholder for param values (default: FUZZ)')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('--raw', action='store_true', help='Show raw URLs without placeholder replacement')
+    args = parser.parse_args()
+
+    domain = args.domain.replace('https://', '').replace('http://', '').strip('/')
+
+    extra_exclude = set()
+    if args.exclude:
+        for ext in args.exclude.split(','):
+            ext = ext.strip()
+            if not ext.startswith('.'):
+                ext = '.' + ext
+            extra_exclude.add(ext)
+
+    print(f"[*] Target: {domain}")
+    print(f"[*] Fetching URLs from archives...")
+
+    all_urls = set()
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(fetch_wayback, domain): 'Wayback',
+            executor.submit(fetch_otx, domain): 'OTX',
+            executor.submit(fetch_urlscan, domain): 'URLScan',
+        }
+        for future in as_completed(futures):
+            source = futures[future]
+            try:
+                urls = future.result()
+                print(f"[+] {source}: {len(urls)} URLs")
+                all_urls.update(urls)
+            except Exception as e:
+                print(f"[!] {source} failed: {e}")
+
+    print(f"[*] Total raw URLs: {len(all_urls)}")
+
+    # Filter
+    filtered = []
+    for url in all_urls:
+        if not has_params(url):
+            continue
+        if is_junk(url):
+            continue
+
+        parsed = urlparse(url)
+        path_lower = parsed.path.lower()
+        if extra_exclude and any(path_lower.endswith(ext) for ext in extra_exclude):
+            continue
+
+        # Subdomain filtering
+        if not args.subs:
+            if not parsed.netloc.endswith(domain) and parsed.netloc != domain:
+                continue
+
+        filtered.append(url)
+
+    # Deduplicate
+    unique = deduplicate_by_params(filtered)
+    print(f"[*] URLs with unique parameters: {len(unique)}")
+
+    # Replace values with placeholder
+    output_urls = []
+    if args.raw:
+        output_urls = unique
+    else:
+        for url in unique:
+            parsed = urlparse(url)
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            new_params = {k: args.placeholder for k in params}
+            from urllib.parse import urlencode
+            new_query = urlencode(new_params)
+            new_url = parsed._replace(query=new_query).geturl()
+            output_urls.append(new_url)
+
+    # Extract all unique parameter names
+    all_params = set()
+    for url in unique:
+        all_params.update(extract_params(url))
+
+    # Output
+    if args.json:
+        result = {
+            'domain': domain,
+            'total_urls': len(output_urls),
+            'unique_params': sorted(all_params),
+            'urls': output_urls,
+        }
+        output_text = json.dumps(result, indent=2)
+    else:
+        lines = []
+        lines.append(f"\n[UNIQUE PARAMETERS] ({len(all_params)} found)")
+        for p in sorted(all_params):
+            lines.append(f"  - {p}")
+        lines.append(f"\n[PARAMETERIZED URLS] ({len(output_urls)} unique)")
+        for url in output_urls:
+            lines.append(url)
+        output_text = '\n'.join(lines)
+
+    if args.output:
+        with open(args.output, 'w') as f:
+            if args.json:
+                f.write(output_text)
+            else:
+                for url in output_urls:
+                    f.write(url + '\n')
+        print(f"[+] Saved to {args.output}")
+    else:
+        print(output_text)
+
+
+if __name__ == '__main__':
+    main()

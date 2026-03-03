@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""graphql-scanner - GraphQL endpoint introspection and vulnerability scanner."""
+
+import sys
+import json
+import argparse
+import requests
+from urllib.parse import urljoin
+import warnings
+warnings.filterwarnings('ignore')
+
+
+INTROSPECTION_QUERY = """
+query IntrospectionQuery {
+  __schema {
+    queryType { name }
+    mutationType { name }
+    subscriptionType { name }
+    types {
+      kind name description
+      fields(includeDeprecated: true) {
+        name description
+        args { name description type { kind name ofType { kind name ofType { kind name } } } }
+        type { kind name ofType { kind name ofType { kind name } } }
+        isDeprecated deprecationReason
+      }
+      inputFields { name description type { kind name ofType { kind name } } }
+      interfaces { kind name }
+      enumValues(includeDeprecated: true) { name description isDeprecated deprecationReason }
+      possibleTypes { kind name }
+    }
+    directives { name description locations args { name description type { kind name ofType { kind name } } } }
+  }
+}
+"""
+
+COMMON_ENDPOINTS = [
+    '/graphql', '/graphiql', '/v1/graphql', '/v2/graphql',
+    '/api/graphql', '/query', '/gql', '/graphql/console',
+    '/v1/explorer', '/api/graphiql',
+]
+
+DANGEROUS_MUTATIONS = [
+    'delete', 'remove', 'drop', 'destroy', 'admin', 'update', 'create',
+    'register', 'login', 'reset', 'password', 'token', 'upload', 'execute',
+    'inject', 'modify', 'grant', 'revoke',
+]
+
+SENSITIVE_FIELDS = [
+    'password', 'secret', 'token', 'key', 'api_key', 'apikey',
+    'credit_card', 'ssn', 'email', 'phone', 'address', 'salary',
+    'private', 'internal', 'admin', 'hash', 'salt',
+]
+
+
+def try_introspection(url, headers=None, verify=True):
+    """Attempt GraphQL introspection query."""
+    h = {'Content-Type': 'application/json'}
+    if headers:
+        h.update(headers)
+
+    # Try POST with JSON
+    try:
+        resp = requests.post(
+            url, json={'query': INTROSPECTION_QUERY},
+            headers=h, timeout=15, verify=verify
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'data' in data and data['data'].get('__schema'):
+                return data['data']['__schema'], 'POST (JSON)'
+    except Exception:
+        pass
+
+    # Try GET with query parameter
+    try:
+        resp = requests.get(
+            url, params={'query': INTROSPECTION_QUERY},
+            headers=h, timeout=15, verify=verify
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'data' in data and data['data'].get('__schema'):
+                return data['data']['__schema'], 'GET'
+    except Exception:
+        pass
+
+    return None, None
+
+
+def discover_endpoint(base_url, headers=None, verify=True):
+    """Try common GraphQL endpoint paths."""
+    found = []
+    for path in COMMON_ENDPOINTS:
+        url = urljoin(base_url.rstrip('/') + '/', path.lstrip('/'))
+        try:
+            resp = requests.post(
+                url,
+                json={'query': '{__typename}'},
+                headers={'Content-Type': 'application/json', **(headers or {})},
+                timeout=5, verify=verify
+            )
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if 'data' in data or 'errors' in data:
+                        found.append(url)
+                except json.JSONDecodeError:
+                    pass
+        except Exception:
+            continue
+    return found
+
+
+def analyze_schema(schema):
+    """Analyze GraphQL schema for vulnerabilities and interesting findings."""
+    findings = {
+        'types_count': 0,
+        'queries': [],
+        'mutations': [],
+        'subscriptions': [],
+        'vulnerabilities': [],
+        'sensitive_fields': [],
+        'custom_types': [],
+    }
+
+    types = schema.get('types', [])
+    query_type = schema.get('queryType', {}).get('name', 'Query')
+    mutation_type = schema.get('mutationType', {}).get('name', 'Mutation') if schema.get('mutationType') else None
+    sub_type = schema.get('subscriptionType', {}).get('name', 'Subscription') if schema.get('subscriptionType') else None
+
+    for t in types:
+        name = t.get('name', '')
+
+        # Skip internal types
+        if name.startswith('__'):
+            continue
+
+        findings['types_count'] += 1
+
+        if t.get('kind') in ('OBJECT', 'INPUT_OBJECT') and not name.startswith('__'):
+            findings['custom_types'].append({
+                'name': name,
+                'kind': t['kind'],
+                'fields': [f['name'] for f in (t.get('fields') or t.get('inputFields') or [])]
+            })
+
+        # Extract queries
+        if name == query_type and t.get('fields'):
+            for field in t['fields']:
+                findings['queries'].append({
+                    'name': field['name'],
+                    'args': [a['name'] for a in field.get('args', [])],
+                    'return_type': _get_type_name(field.get('type', {})),
+                })
+
+        # Extract mutations
+        if mutation_type and name == mutation_type and t.get('fields'):
+            for field in t['fields']:
+                mut = {
+                    'name': field['name'],
+                    'args': [a['name'] for a in field.get('args', [])],
+                    'return_type': _get_type_name(field.get('type', {})),
+                }
+                findings['mutations'].append(mut)
+
+                # Check for dangerous mutations
+                for keyword in DANGEROUS_MUTATIONS:
+                    if keyword in field['name'].lower():
+                        findings['vulnerabilities'].append({
+                            'severity': 'MEDIUM',
+                            'title': f'Potentially dangerous mutation: {field["name"]}',
+                            'description': f'Mutation "{field["name"]}" may allow {keyword} operations. '
+                                           'Verify authorization controls.',
+                        })
+                        break
+
+        # Extract subscriptions
+        if sub_type and name == sub_type and t.get('fields'):
+            for field in t['fields']:
+                findings['subscriptions'].append({
+                    'name': field['name'],
+                    'args': [a['name'] for a in field.get('args', [])],
+                })
+
+        # Check for sensitive fields
+        for field in (t.get('fields') or []):
+            for sensitive in SENSITIVE_FIELDS:
+                if sensitive in field['name'].lower():
+                    findings['sensitive_fields'].append({
+                        'type': name,
+                        'field': field['name'],
+                        'keyword': sensitive,
+                    })
+
+    # Introspection enabled vulnerability
+    findings['vulnerabilities'].insert(0, {
+        'severity': 'LOW',
+        'title': 'Introspection Enabled',
+        'description': 'GraphQL introspection is enabled, exposing the full API schema. '
+                       'This should be disabled in production.',
+    })
+
+    # Check for lack of pagination
+    for q in findings['queries']:
+        if not any(a in q['args'] for a in ['limit', 'first', 'last', 'page', 'offset', 'after', 'before']):
+            if q['return_type'] and ('List' in q['return_type'] or 'Connection' in q['return_type']):
+                findings['vulnerabilities'].append({
+                    'severity': 'MEDIUM',
+                    'title': f'No pagination on query: {q["name"]}',
+                    'description': 'Query returns a list without pagination arguments. '
+                                   'May be vulnerable to DoS via large result sets.',
+                })
+
+    return findings
+
+
+def _get_type_name(type_obj):
+    """Recursively get type name."""
+    if not type_obj:
+        return ''
+    name = type_obj.get('name', '')
+    if name:
+        return name
+    of_type = type_obj.get('ofType')
+    if of_type:
+        inner = _get_type_name(of_type)
+        kind = type_obj.get('kind', '')
+        if kind == 'LIST':
+            return f'[{inner}]'
+        elif kind == 'NON_NULL':
+            return f'{inner}!'
+        return inner
+    return type_obj.get('kind', '')
+
+
+def test_batching(url, headers=None, verify=True):
+    """Test if query batching is supported (DoS vector)."""
+    h = {'Content-Type': 'application/json'}
+    if headers:
+        h.update(headers)
+
+    batch = [{'query': '{__typename}'}, {'query': '{__typename}'}]
+    try:
+        resp = requests.post(url, json=batch, headers=h, timeout=10, verify=verify)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and len(data) == 2:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='GraphQL endpoint scanner and vulnerability analyzer',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  graphql-scanner -u http://target.com/graphql\n'
+               '  graphql-scanner -u http://target.com --discover\n'
+               '  graphql-scanner -u http://target.com/graphql --dump-schema\n'
+               '  graphql-scanner -u http://target.com/graphql -H "Authorization: Bearer tok"'
+    )
+    parser.add_argument('-u', '--url', required=True, help='Target URL')
+    parser.add_argument('-H', '--header', action='append', default=[],
+                        help='Custom header (key:value)')
+    parser.add_argument('--discover', action='store_true', help='Discover GraphQL endpoints')
+    parser.add_argument('--dump-schema', action='store_true', help='Dump full schema JSON')
+    parser.add_argument('-k', '--insecure', action='store_true', help='Skip SSL verification')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('--test-batching', action='store_true', help='Test query batching')
+    args = parser.parse_args()
+
+    headers = {}
+    for h in args.header:
+        key, _, value = h.partition(':')
+        headers[key.strip()] = value.strip()
+
+    verify = not args.insecure
+
+    # Discover endpoints
+    if args.discover:
+        print(f"[*] Discovering GraphQL endpoints on {args.url}")
+        endpoints = discover_endpoint(args.url, headers, verify)
+        if endpoints:
+            print(f"[+] Found {len(endpoints)} endpoints:")
+            for ep in endpoints:
+                print(f"  - {ep}")
+        else:
+            print("[-] No GraphQL endpoints found")
+        return
+
+    # Introspection
+    print(f"[*] Attempting introspection on {args.url}")
+    schema, method = try_introspection(args.url, headers, verify)
+
+    if not schema:
+        print("[-] Introspection failed or disabled")
+        print("[*] Trying endpoint discovery...")
+        endpoints = discover_endpoint(args.url, headers, verify)
+        if endpoints:
+            for ep in endpoints:
+                schema, method = try_introspection(ep, headers, verify)
+                if schema:
+                    print(f"[+] Introspection succeeded on {ep} via {method}")
+                    break
+        if not schema:
+            print("[-] Could not retrieve schema")
+            sys.exit(1)
+    else:
+        print(f"[+] Introspection succeeded via {method}")
+
+    if args.dump_schema:
+        print(json.dumps(schema, indent=2))
+        return
+
+    # Analyze
+    findings = analyze_schema(schema)
+
+    # Test batching
+    if args.test_batching:
+        if test_batching(args.url, headers, verify):
+            findings['vulnerabilities'].append({
+                'severity': 'MEDIUM',
+                'title': 'Query Batching Supported',
+                'description': 'Server accepts batched queries. Can be used for DoS or brute-force attacks.',
+            })
+
+    if args.json:
+        print(json.dumps(findings, indent=2))
+    else:
+        print(f"\n{'=' * 60}")
+        print(f"  GRAPHQL SCAN RESULTS")
+        print(f"{'=' * 60}")
+        print(f"  Types: {findings['types_count']}")
+        print(f"  Queries: {len(findings['queries'])}")
+        print(f"  Mutations: {len(findings['mutations'])}")
+        print(f"  Subscriptions: {len(findings['subscriptions'])}")
+
+        if findings['queries']:
+            print(f"\n[QUERIES]")
+            for q in findings['queries'][:20]:
+                args_str = ', '.join(q['args']) if q['args'] else 'none'
+                print(f"  {q['name']}({args_str}) -> {q['return_type']}")
+
+        if findings['mutations']:
+            print(f"\n[MUTATIONS]")
+            for m in findings['mutations'][:20]:
+                args_str = ', '.join(m['args']) if m['args'] else 'none'
+                print(f"  {m['name']}({args_str}) -> {m['return_type']}")
+
+        if findings['sensitive_fields']:
+            print(f"\n[SENSITIVE FIELDS] ({len(findings['sensitive_fields'])} found)")
+            for sf in findings['sensitive_fields']:
+                print(f"  {sf['type']}.{sf['field']} (keyword: {sf['keyword']})")
+
+        if findings['vulnerabilities']:
+            print(f"\n[VULNERABILITIES] ({len(findings['vulnerabilities'])} found)")
+            for v in findings['vulnerabilities']:
+                print(f"  [{v['severity']}] {v['title']}")
+                print(f"    {v['description']}")
+
+        if findings['custom_types']:
+            print(f"\n[CUSTOM TYPES] ({len(findings['custom_types'])} types)")
+            for ct in findings['custom_types'][:15]:
+                fields_str = ', '.join(ct['fields'][:5])
+                extra = f" +{len(ct['fields'])-5} more" if len(ct['fields']) > 5 else ""
+                print(f"  {ct['name']} ({ct['kind']}): {fields_str}{extra}")
+
+
+if __name__ == '__main__':
+    main()

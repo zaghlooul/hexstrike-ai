@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""arjun - HTTP parameter discovery tool."""
+
+import sys
+import json
+import argparse
+import string
+import random
+import requests
+from urllib.parse import urlparse, urlencode, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+warnings.filterwarnings('ignore')
+
+# Common parameter names for discovery
+COMMON_PARAMS = [
+    'id', 'page', 'search', 'q', 'query', 'name', 'user', 'username',
+    'email', 'password', 'pass', 'token', 'key', 'api_key', 'apikey',
+    'action', 'type', 'category', 'cat', 'sort', 'order', 'limit',
+    'offset', 'start', 'count', 'size', 'num', 'p', 'pg', 'lang',
+    'language', 'locale', 'format', 'callback', 'jsonp', 'redirect',
+    'url', 'next', 'return', 'returnUrl', 'return_url', 'redirect_uri',
+    'ref', 'source', 'utm_source', 'utm_medium', 'utm_campaign',
+    'file', 'path', 'dir', 'folder', 'filename', 'template', 'view',
+    'layout', 'theme', 'style', 'css', 'include', 'inc', 'require',
+    'module', 'plugin', 'extension', 'admin', 'debug', 'test',
+    'preview', 'draft', 'version', 'v', 'api', 'method', 'cmd',
+    'command', 'exec', 'execute', 'run', 'process', 'do', 'func',
+    'function', 'handler', 'controller', 'route', 'endpoint',
+    'submit', 'save', 'update', 'delete', 'remove', 'create', 'add',
+    'edit', 'modify', 'change', 'set', 'get', 'fetch', 'load', 'read',
+    'write', 'upload', 'download', 'export', 'import', 'backup',
+    'restore', 'reset', 'clear', 'flush', 'purge', 'refresh',
+    'status', 'state', 'mode', 'level', 'role', 'scope', 'access',
+    'permission', 'auth', 'authorize', 'authentication', 'session',
+    'cookie', 'csrf', 'nonce', 'timestamp', 'date', 'time', 'from',
+    'to', 'min', 'max', 'range', 'filter', 'where', 'field', 'column',
+    'table', 'db', 'database', 'collection', 'select', 'insert',
+    'config', 'setting', 'option', 'param', 'parameter', 'arg',
+    'data', 'body', 'content', 'text', 'message', 'comment', 'note',
+    'title', 'subject', 'description', 'summary', 'detail', 'info',
+    'width', 'height', 'color', 'bg', 'background', 'image', 'img',
+    'photo', 'avatar', 'icon', 'logo', 'banner', 'thumbnail',
+    'price', 'cost', 'amount', 'total', 'quantity', 'qty', 'discount',
+    'coupon', 'code', 'promo', 'voucher', 'gift', 'card', 'payment',
+    'checkout', 'cart', 'item', 'product', 'sku', 'barcode',
+    'phone', 'mobile', 'address', 'city', 'state', 'zip', 'country',
+    'lat', 'lng', 'longitude', 'latitude', 'geo', 'location', 'place',
+    'callback_url', 'webhook', 'notify', 'channel', 'topic', 'event',
+    'log', 'trace', 'verbose', 'quiet', 'silent', 'output', 'input',
+]
+
+
+def random_string(length=8):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+def get_baseline(url, method, headers, verify):
+    """Get baseline response to compare against."""
+    canary = random_string(12)
+    params = {random_string(): canary}
+
+    try:
+        if method == 'GET':
+            resp = requests.get(url, params=params, headers=headers,
+                                timeout=10, verify=verify, allow_redirects=True)
+        else:
+            resp = requests.post(url, data=params, headers=headers,
+                                 timeout=10, verify=verify, allow_redirects=True)
+        return {
+            'status': resp.status_code,
+            'length': len(resp.text),
+            'words': len(resp.text.split()),
+            'headers': dict(resp.headers),
+            'body': resp.text,
+        }
+    except Exception as e:
+        print(f"[!] Error getting baseline: {e}", file=sys.stderr)
+        return None
+
+
+def test_param_batch(url, method, params_batch, headers, verify, baseline):
+    """Test a batch of parameters."""
+    found = []
+    canary = random_string(10)
+    test_params = {p: canary for p in params_batch}
+
+    try:
+        if method == 'GET':
+            resp = requests.get(url, params=test_params, headers=headers,
+                                timeout=10, verify=verify, allow_redirects=True)
+        else:
+            resp = requests.post(url, data=test_params, headers=headers,
+                                 timeout=10, verify=verify, allow_redirects=True)
+
+        # Check for differences
+        resp_length = len(resp.text)
+        length_diff = abs(resp_length - baseline['length'])
+
+        if (resp.status_code != baseline['status'] or
+                length_diff > 50 or
+                canary in resp.text):
+            # One of the params caused a change, test individually
+            for param in params_batch:
+                found_param = test_single_param(url, method, param, headers, verify, baseline)
+                if found_param:
+                    found.append(found_param)
+    except Exception:
+        pass
+
+    return found
+
+
+def test_single_param(url, method, param, headers, verify, baseline):
+    """Test a single parameter."""
+    canary = random_string(10)
+    test_params = {param: canary}
+
+    try:
+        if method == 'GET':
+            resp = requests.get(url, params=test_params, headers=headers,
+                                timeout=10, verify=verify, allow_redirects=True)
+        else:
+            resp = requests.post(url, data=test_params, headers=headers,
+                                 timeout=10, verify=verify, allow_redirects=True)
+
+        resp_length = len(resp.text)
+        length_diff = abs(resp_length - baseline['length'])
+
+        reasons = []
+        if resp.status_code != baseline['status']:
+            reasons.append(f'status: {baseline["status"]}->{resp.status_code}')
+        if length_diff > 50:
+            reasons.append(f'length: {baseline["length"]}->{resp_length} (diff: {length_diff})')
+        if canary in resp.text:
+            reasons.append('reflected')
+
+        if reasons:
+            return {
+                'name': param,
+                'method': method,
+                'reason': ', '.join(reasons),
+            }
+    except Exception:
+        pass
+
+    return None
+
+
+def load_wordlist(path):
+    """Load parameter names from wordlist file."""
+    params = []
+    with open(path) as f:
+        for line in f:
+            param = line.strip()
+            if param and not param.startswith('#'):
+                params.append(param)
+    return params
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='HTTP parameter discovery tool',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  arjun -u http://target.com/page\n'
+               '  arjun -u http://target.com/api --post\n'
+               '  arjun -u http://target.com/page -w params.txt\n'
+               '  arjun -u http://target.com/page -t 20'
+    )
+    parser.add_argument('-u', '--url', required=True, help='Target URL')
+    parser.add_argument('--get', action='store_true', default=True, help='Use GET method (default)')
+    parser.add_argument('--post', action='store_true', help='Use POST method')
+    parser.add_argument('-w', '--wordlist', help='Custom parameter wordlist')
+    parser.add_argument('-t', '--threads', type=int, default=10, help='Thread count (default: 10)')
+    parser.add_argument('-b', '--batch-size', type=int, default=10, help='Parameters per batch (default: 10)')
+    parser.add_argument('-H', '--header', action='append', default=[], help='Custom header (key:value)')
+    parser.add_argument('-k', '--insecure', action='store_true', help='Skip SSL verification')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('--stable', action='store_true', help='Test each param individually (slower but accurate)')
+    args = parser.parse_args()
+
+    method = 'POST' if args.post else 'GET'
+    verify = not args.insecure
+
+    headers = {'User-Agent': 'arjun-hexstrike/1.0'}
+    for h in args.header:
+        key, _, value = h.partition(':')
+        headers[key.strip()] = value.strip()
+
+    # Load parameters
+    if args.wordlist:
+        params = load_wordlist(args.wordlist)
+    else:
+        params = COMMON_PARAMS
+
+    print(f"[*] Target: {args.url}")
+    print(f"[*] Method: {method}")
+    print(f"[*] Parameters to test: {len(params)}")
+
+    # Get baseline
+    print(f"[*] Getting baseline response...")
+    baseline = get_baseline(args.url, method, headers, verify)
+    if not baseline:
+        print("[!] Could not get baseline response")
+        sys.exit(1)
+
+    print(f"[*] Baseline: status={baseline['status']}, length={baseline['length']}")
+
+    # Test parameters
+    found_params = []
+
+    if args.stable:
+        # Test each parameter individually
+        print(f"[*] Testing parameters individually (stable mode)...")
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            futures = {
+                executor.submit(test_single_param, args.url, method, p, headers, verify, baseline): p
+                for p in params
+            }
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                if done % 20 == 0:
+                    print(f"[*] Progress: {done}/{len(params)}", end='\r')
+                result = future.result()
+                if result:
+                    found_params.append(result)
+                    print(f"\n[+] Found: {result['name']} ({result['reason']})")
+    else:
+        # Batch testing
+        print(f"[*] Testing in batches of {args.batch_size}...")
+        batches = [params[i:i+args.batch_size] for i in range(0, len(params), args.batch_size)]
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            futures = {
+                executor.submit(test_param_batch, args.url, method, batch, headers, verify, baseline): batch
+                for batch in batches
+            }
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                if done % 5 == 0:
+                    print(f"[*] Progress: {done}/{len(batches)} batches", end='\r')
+                results = future.result()
+                for r in results:
+                    found_params.append(r)
+                    print(f"\n[+] Found: {r['name']} ({r['reason']})")
+
+    print(f"\n\n[*] Scan complete. Found {len(found_params)} parameters.")
+
+    if args.json:
+        print(json.dumps({'url': args.url, 'method': method, 'parameters': found_params}, indent=2))
+    elif found_params:
+        print(f"\n{'=' * 60}")
+        print(f"  DISCOVERED PARAMETERS")
+        print(f"{'=' * 60}")
+        for p in found_params:
+            print(f"  {p['name']:<25s} [{p['reason']}]")
+
+        # Generate sample URL/curl
+        print(f"\n[*] Sample request:")
+        if method == 'GET':
+            qs = '&'.join(f"{p['name']}=FUZZ" for p in found_params)
+            print(f"  curl '{args.url}?{qs}'")
+        else:
+            data = '&'.join(f"{p['name']}=FUZZ" for p in found_params)
+            print(f"  curl -X POST -d '{data}' '{args.url}'")
+
+
+if __name__ == '__main__':
+    main()

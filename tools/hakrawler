@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""hakrawler - Fast web crawler for discovering endpoints and links."""
+
+import sys
+import re
+import json
+import argparse
+import requests
+from urllib.parse import urlparse, urljoin, parse_qs
+from html.parser import HTMLParser
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class LinkExtractor(HTMLParser):
+    """Extract links and interesting patterns from HTML."""
+
+    def __init__(self, base_url):
+        super().__init__()
+        self.base_url = base_url
+        self.links = set()
+        self.forms = []
+        self.scripts = set()
+        self.comments = []
+        self._current_form = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+
+        # Links from various attributes
+        for attr in ('href', 'src', 'action', 'data-url', 'data-href'):
+            value = attrs_dict.get(attr)
+            if value:
+                resolved = urljoin(self.base_url, value)
+                self.links.add(resolved)
+
+        # Script sources
+        if tag == 'script' and 'src' in attrs_dict:
+            self.scripts.add(urljoin(self.base_url, attrs_dict['src']))
+
+        # Forms
+        if tag == 'form':
+            self._current_form = {
+                'action': urljoin(self.base_url, attrs_dict.get('action', '')),
+                'method': attrs_dict.get('method', 'GET').upper(),
+                'inputs': [],
+            }
+        if tag == 'input' and self._current_form is not None:
+            self._current_form['inputs'].append({
+                'name': attrs_dict.get('name', ''),
+                'type': attrs_dict.get('type', 'text'),
+                'value': attrs_dict.get('value', ''),
+            })
+
+    def handle_endtag(self, tag):
+        if tag == 'form' and self._current_form is not None:
+            self.forms.append(self._current_form)
+            self._current_form = None
+
+    def handle_comment(self, data):
+        self.comments.append(data.strip())
+
+    def handle_data(self, data):
+        pass
+
+
+def extract_js_urls(content, base_url):
+    """Extract URLs from JavaScript content."""
+    urls = set()
+    # Match string literals that look like paths/URLs
+    patterns = [
+        r'["\'](/[a-zA-Z0-9._/-]+(?:\?[a-zA-Z0-9._=&/-]+)?)["\']',
+        r'["\']https?://[a-zA-Z0-9._/-]+(?:\?[a-zA-Z0-9._=&/-]+)?["\']',
+        r'(?:fetch|axios\.get|axios\.post|\.ajax)\s*\(\s*["\']([^"\']+)["\']',
+        r'(?:url|endpoint|api|path|route)\s*[:=]\s*["\']([^"\']+)["\']',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, content):
+            url = match.group(1) if match.lastindex else match.group(0).strip('"\'')
+            resolved = urljoin(base_url, url)
+            urls.add(resolved)
+    return urls
+
+
+def crawl_url(url, headers, verify, extract_js=False):
+    """Crawl a single URL and extract links."""
+    result = {
+        'url': url,
+        'links': set(),
+        'scripts': set(),
+        'forms': [],
+        'js_urls': set(),
+        'status': None,
+        'error': None,
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10, verify=verify,
+                            allow_redirects=True)
+        result['status'] = resp.status_code
+
+        content_type = resp.headers.get('Content-Type', '')
+
+        if 'html' in content_type:
+            parser = LinkExtractor(url)
+            try:
+                parser.feed(resp.text)
+            except Exception:
+                pass
+            result['links'] = parser.links
+            result['scripts'] = parser.scripts
+            result['forms'] = parser.forms
+
+            # Extract JS URLs from inline scripts
+            if extract_js:
+                result['js_urls'] = extract_js_urls(resp.text, url)
+
+        elif 'javascript' in content_type:
+            result['js_urls'] = extract_js_urls(resp.text, url)
+
+    except requests.exceptions.Timeout:
+        result['error'] = 'timeout'
+    except Exception as e:
+        result['error'] = str(e)
+
+    return result
+
+
+def is_same_scope(url, target_domain, include_subs=False):
+    """Check if URL is within scope."""
+    parsed = urlparse(url)
+    if not parsed.scheme.startswith('http'):
+        return False
+    if include_subs:
+        return parsed.netloc.endswith(target_domain)
+    return parsed.netloc == target_domain
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Fast web crawler for discovering endpoints and links',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  hakrawler -u http://target.com\n'
+               '  hakrawler -u http://target.com -d 3 -s\n'
+               '  echo http://target.com | hakrawler\n'
+               '  hakrawler -u http://target.com --js -t 20'
+    )
+    parser.add_argument('-u', '--url', help='Target URL')
+    parser.add_argument('-d', '--depth', type=int, default=2, help='Crawl depth (default: 2)')
+    parser.add_argument('-t', '--threads', type=int, default=10, help='Thread count (default: 10)')
+    parser.add_argument('-s', '--subs', action='store_true', help='Include subdomains')
+    parser.add_argument('--js', action='store_true', help='Extract URLs from JavaScript')
+    parser.add_argument('-H', '--header', action='append', default=[], help='Custom header (key:value)')
+    parser.add_argument('-k', '--insecure', action='store_true', help='Skip SSL verification')
+    parser.add_argument('--forms', action='store_true', help='Show discovered forms')
+    parser.add_argument('--params-only', action='store_true', help='Only show URLs with parameters')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('-o', '--output', help='Output file')
+    args = parser.parse_args()
+
+    # Get target URL(s)
+    urls = []
+    if args.url:
+        urls.append(args.url)
+    elif not sys.stdin.isatty():
+        urls = [line.strip() for line in sys.stdin if line.strip()]
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    headers = {'User-Agent': 'hakrawler-hexstrike/1.0'}
+    for h in args.header:
+        key, _, value = h.partition(':')
+        headers[key.strip()] = value.strip()
+
+    verify = not args.insecure
+
+    all_found = set()
+    all_forms = []
+    visited = set()
+
+    for start_url in urls:
+        if not start_url.startswith(('http://', 'https://')):
+            start_url = 'https://' + start_url
+
+        target_domain = urlparse(start_url).netloc
+        print(f"[*] Crawling: {start_url} (depth: {args.depth})", file=sys.stderr)
+
+        queue = deque([(start_url, 0)])
+        visited.add(start_url)
+
+        while queue:
+            # Process current depth level in parallel
+            current_batch = []
+            while queue:
+                url, depth = queue.popleft()
+                if depth <= args.depth:
+                    current_batch.append((url, depth))
+
+            if not current_batch:
+                break
+
+            with ThreadPoolExecutor(max_workers=args.threads) as executor:
+                futures = {
+                    executor.submit(crawl_url, url, headers, verify, args.js): (url, depth)
+                    for url, depth in current_batch
+                }
+
+                for future in as_completed(futures):
+                    url, depth = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception:
+                        continue
+
+                    # Collect found URLs
+                    new_urls = result['links'] | result['scripts'] | result['js_urls']
+                    for found_url in new_urls:
+                        # Clean fragment
+                        found_url = found_url.split('#')[0]
+                        if not found_url:
+                            continue
+
+                        all_found.add(found_url)
+
+                        # Queue for further crawling if in scope
+                        if (found_url not in visited and
+                                depth + 1 <= args.depth and
+                                is_same_scope(found_url, target_domain, args.subs)):
+                            visited.add(found_url)
+                            queue.append((found_url, depth + 1))
+
+                    all_forms.extend(result['forms'])
+
+        print(f"[*] Pages crawled: {len(visited)}", file=sys.stderr)
+
+    # Filter
+    output_urls = sorted(all_found)
+    if args.params_only:
+        output_urls = [u for u in output_urls if '?' in u and '=' in u]
+
+    # Output
+    if args.json:
+        result = {
+            'urls': output_urls,
+            'total': len(output_urls),
+            'pages_crawled': len(visited),
+        }
+        if args.forms:
+            result['forms'] = all_forms
+        output_text = json.dumps(result, indent=2)
+    else:
+        lines = []
+        for url in output_urls:
+            lines.append(url)
+        if args.forms and all_forms:
+            lines.append(f"\n[FORMS] ({len(all_forms)} found)")
+            for form in all_forms:
+                inputs = ', '.join(f"{i['name']}({i['type']})" for i in form['inputs'] if i['name'])
+                lines.append(f"  {form['method']} {form['action']} -> {inputs}")
+        output_text = '\n'.join(lines)
+
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(output_text)
+        print(f"[+] Saved {len(output_urls)} URLs to {args.output}", file=sys.stderr)
+    else:
+        print(output_text)
+
+    print(f"[*] Total URLs found: {len(output_urls)}", file=sys.stderr)
+
+
+if __name__ == '__main__':
+    main()

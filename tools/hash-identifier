@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""hash-identifier - Identify hash types by their format and length."""
+
+import re
+import sys
+import argparse
+
+HASH_PATTERNS = [
+    # MD5
+    (r'^[a-fA-F0-9]{32}$', 'MD5', 'Also possible: NTLM, MD4, LM'),
+    # SHA-1
+    (r'^[a-fA-F0-9]{40}$', 'SHA-1', 'Also possible: MySQL5, RIPEMD-160'),
+    # SHA-224
+    (r'^[a-fA-F0-9]{56}$', 'SHA-224', ''),
+    # SHA-256
+    (r'^[a-fA-F0-9]{64}$', 'SHA-256', 'Also possible: Keccak-256, BLAKE2s-256'),
+    # SHA-384
+    (r'^[a-fA-F0-9]{96}$', 'SHA-384', ''),
+    # SHA-512
+    (r'^[a-fA-F0-9]{128}$', 'SHA-512', 'Also possible: Whirlpool, SHA3-512, BLAKE2b-512'),
+    # bcrypt
+    (r'^\$2[aby]?\$\d{2}\$.{53}$', 'bcrypt', 'Blowfish-based'),
+    # MD5 crypt
+    (r'^\$1\$.{8}\$.{22}$', 'MD5 Crypt (Unix)', ''),
+    # SHA-256 crypt
+    (r'^\$5\$(rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{43}$', 'SHA-256 Crypt (Unix)', ''),
+    # SHA-512 crypt
+    (r'^\$6\$(rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}$', 'SHA-512 Crypt (Unix)', ''),
+    # MySQL old
+    (r'^[a-fA-F0-9]{16}$', 'MySQL 3.x/4.x', 'Also possible: DES, CRC-64'),
+    # NTLM/LM
+    (r'^[a-fA-F0-9]{32}:[a-fA-F0-9]{32}$', 'NTLM:LM Hash Pair', ''),
+    # NTHash ($NT$)
+    (r'^\$NT\$[a-fA-F0-9]{32}$', 'NT Hash (prefixed)', ''),
+    # MD5 (APR)
+    (r'^\$apr1\$.{8}\$.{22}$', 'Apache APR1 MD5', ''),
+    # Django
+    (r'^pbkdf2_sha256\$\d+\$.+\$.+$', 'Django PBKDF2-SHA256', ''),
+    (r'^sha1\$.+\$.+$', 'Django SHA-1', ''),
+    (r'^md5\$.+\$.+$', 'Django MD5', ''),
+    # Argon2
+    (r'^\$argon2(i|d|id)\$', 'Argon2', ''),
+    # scrypt
+    (r'^\$scrypt\$', 'scrypt', ''),
+    # Cisco
+    (r'^[a-fA-F0-9]{32}$', 'Cisco-PIX MD5', ''),
+    # Oracle
+    (r'^S:[A-F0-9]{60}$', 'Oracle 11g+', ''),
+    # Base64 encoded
+    (r'^[A-Za-z0-9+/]+=*$', 'Possible Base64 encoded hash', 'Try decoding first'),
+    # CRC-32
+    (r'^[a-fA-F0-9]{8}$', 'CRC-32', 'Also possible: Adler-32'),
+    # Hashcat modes
+    (r'^\$HEX\[', 'Hashcat hex-encoded', ''),
+    # JWT
+    (r'^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', 'JWT Token', 'Use jwt-analyzer for details'),
+]
+
+HASHCAT_MODES = {
+    'MD5': '0', 'SHA-1': '100', 'SHA-256': '1400', 'SHA-512': '1700',
+    'NTLM:LM Hash Pair': '1000', 'bcrypt': '3200', 'MD5 Crypt (Unix)': '500',
+    'SHA-256 Crypt (Unix)': '7400', 'SHA-512 Crypt (Unix)': '1800',
+    'MySQL 3.x/4.x': '200', 'Apache APR1 MD5': '1600',
+    'Django PBKDF2-SHA256': '10000', 'Argon2': '13400', 'CRC-32': '11500',
+}
+
+
+def identify_hash(hash_str):
+    """Identify possible hash types for a given hash string."""
+    hash_str = hash_str.strip()
+    results = []
+    seen = set()
+
+    for pattern, name, note in HASH_PATTERNS:
+        if re.match(pattern, hash_str) and name not in seen:
+            mode = HASHCAT_MODES.get(name, 'N/A')
+            results.append({'type': name, 'hashcat_mode': mode, 'note': note})
+            seen.add(name)
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Identify hash types by format and length',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  hash-identifier 5d41402abc4b2a76b9719d911017c592\n'
+               '  hash-identifier -f hashes.txt\n'
+               '  echo "hash" | hash-identifier -'
+    )
+    parser.add_argument('hash', nargs='?', help='Hash string to identify')
+    parser.add_argument('-f', '--file', help='File containing hashes (one per line)')
+    parser.add_argument('-j', '--json', action='store_true', help='Output as JSON')
+    args = parser.parse_args()
+
+    hashes = []
+
+    if args.file:
+        with open(args.file) as f:
+            hashes = [line.strip() for line in f if line.strip()]
+    elif args.hash == '-' or (not args.hash and not sys.stdin.isatty()):
+        hashes = [line.strip() for line in sys.stdin if line.strip()]
+    elif args.hash:
+        hashes = [args.hash]
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    all_results = {}
+    for h in hashes:
+        results = identify_hash(h)
+        all_results[h] = results
+
+    if args.json:
+        import json
+        print(json.dumps(all_results, indent=2))
+    else:
+        for h, results in all_results.items():
+            print(f"\n[*] Analyzing: {h}")
+            print(f"[*] Length: {len(h)} characters")
+            if results:
+                for i, r in enumerate(results, 1):
+                    print(f"  [{i}] {r['type']} (Hashcat mode: {r['hashcat_mode']})")
+                    if r['note']:
+                        print(f"      Note: {r['note']}")
+            else:
+                print("  [!] Unknown hash format")
+
+
+if __name__ == '__main__':
+    main()

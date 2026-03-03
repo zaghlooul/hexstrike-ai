@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""searchsploit - Search for exploits in local and online databases."""
+
+import sys
+import os
+import re
+import json
+import argparse
+import csv
+from pathlib import Path
+
+# ExploitDB CSV path (standard Kali location)
+EXPLOITDB_CSV = '/usr/share/exploitdb/files_exploits.csv'
+EXPLOITDB_PATH = '/usr/share/exploitdb/'
+
+# Fallback: bundled exploit database
+BUNDLED_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'exploits.json')
+
+
+def load_exploitdb_csv():
+    """Load ExploitDB from CSV file."""
+    exploits = []
+    if not os.path.exists(EXPLOITDB_CSV):
+        return None
+
+    with open(EXPLOITDB_CSV, 'r', encoding='utf-8', errors='ignore') as f:
+        reader = csv.reader(f)
+        next(reader, None)  # Skip header
+        for row in reader:
+            if len(row) >= 6:
+                exploits.append({
+                    'id': row[0],
+                    'file': row[1],
+                    'description': row[2],
+                    'date': row[3],
+                    'author': row[4],
+                    'platform': row[5] if len(row) > 5 else '',
+                    'type': row[6] if len(row) > 6 else '',
+                    'port': row[7] if len(row) > 7 else '',
+                })
+    return exploits
+
+
+def search_online(query):
+    """Search ExploitDB online via their site."""
+    try:
+        import requests
+        url = f"https://www.exploit-db.com/search?q={requests.utils.quote(query)}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:102.0)',
+            'Accept': 'application/json, text/javascript, */*',
+            'X-Requested-With': 'XMLHttpRequest',
+        }
+        resp = requests.get(
+            "https://www.exploit-db.com/search",
+            params={'q': query},
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                return data.get('data', [])
+            except json.JSONDecodeError:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def search_exploits(exploits, terms, exact=False, platform_filter=None, type_filter=None):
+    """Search exploits matching all terms."""
+    results = []
+    for exp in exploits:
+        desc = exp.get('description', '').lower()
+        file_path = exp.get('file', '').lower()
+        searchable = f"{desc} {file_path}"
+
+        if exact:
+            if all(term.lower() in searchable for term in terms):
+                match = True
+            else:
+                match = False
+        else:
+            match = all(
+                re.search(re.escape(term.lower()), searchable) for term in terms
+            )
+
+        if match:
+            if platform_filter and platform_filter.lower() not in exp.get('platform', '').lower():
+                continue
+            if type_filter and type_filter.lower() not in exp.get('type', '').lower():
+                continue
+            results.append(exp)
+
+    return results
+
+
+def format_results(results, show_path=False, json_output=False):
+    """Format search results."""
+    if json_output:
+        return json.dumps(results, indent=2)
+
+    if not results:
+        return "[!] No results found"
+
+    lines = []
+    lines.append(f"\n{'=' * 80}")
+    lines.append(f" Exploits Found: {len(results)}")
+    lines.append(f"{'=' * 80}")
+
+    # Table header
+    lines.append(f"{'ID':<10} {'Description':<50} {'Platform':<10} {'Type':<10}")
+    lines.append('-' * 80)
+
+    for exp in results[:50]:  # Limit to 50 results
+        eid = exp.get('id', 'N/A')[:9]
+        desc = exp.get('description', '')[:49]
+        platform = exp.get('platform', '')[:9]
+        etype = exp.get('type', '')[:9]
+        lines.append(f"{eid:<10} {desc:<50} {platform:<10} {etype:<10}")
+
+        if show_path and exp.get('file'):
+            full_path = os.path.join(EXPLOITDB_PATH, exp['file'])
+            lines.append(f"           Path: {full_path}")
+
+    if len(results) > 50:
+        lines.append(f"\n... and {len(results) - 50} more results")
+
+    return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Search for exploits in ExploitDB',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  searchsploit apache 2.4\n'
+               '  searchsploit -p linux kernel 5.4\n'
+               '  searchsploit --type remote wordpress\n'
+               '  searchsploit -j openssh'
+    )
+    parser.add_argument('terms', nargs='+', help='Search terms')
+    parser.add_argument('-e', '--exact', action='store_true', help='Exact match only')
+    parser.add_argument('-p', '--platform', help='Filter by platform (e.g., linux, windows)')
+    parser.add_argument('--type', dest='exploit_type', help='Filter by type (local, remote, webapps, dos)')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('--path', action='store_true', help='Show full path to exploit file')
+    parser.add_argument('--online', action='store_true', help='Search online ExploitDB')
+    parser.add_argument('--nmap', metavar='XML_FILE', help='Parse nmap XML and auto-search')
+    args = parser.parse_args()
+
+    if args.nmap:
+        # Parse nmap XML for service versions
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(args.nmap)
+            root = tree.getroot()
+            services = []
+            for port in root.iter('port'):
+                service = port.find('service')
+                if service is not None:
+                    product = service.get('product', '')
+                    version = service.get('version', '')
+                    if product:
+                        services.append(f"{product} {version}".strip())
+
+            if services:
+                print(f"[*] Found {len(services)} services in nmap scan")
+                exploits = load_exploitdb_csv()
+                if not exploits:
+                    print("[!] ExploitDB CSV not found, trying online search")
+                    for svc in services:
+                        print(f"\n[*] Searching: {svc}")
+                        online_results = search_online(svc)
+                        if online_results:
+                            print(format_results(online_results, json_output=args.json))
+                    return
+
+                for svc in services:
+                    print(f"\n[*] Searching: {svc}")
+                    results = search_exploits(exploits, svc.split())
+                    print(format_results(results, show_path=args.path, json_output=args.json))
+                return
+        except Exception as e:
+            print(f"[!] Error parsing nmap XML: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # Normal search
+    exploits = load_exploitdb_csv()
+
+    if exploits:
+        results = search_exploits(
+            exploits, args.terms,
+            exact=args.exact,
+            platform_filter=args.platform,
+            type_filter=args.exploit_type,
+        )
+        print(format_results(results, show_path=args.path, json_output=args.json))
+    elif args.online:
+        query = ' '.join(args.terms)
+        print(f"[*] Searching online for: {query}")
+        online_results = search_online(query)
+        if online_results:
+            print(format_results(online_results, json_output=args.json))
+        else:
+            print("[!] No results or online search failed")
+    else:
+        print("[!] ExploitDB CSV not found at " + EXPLOITDB_CSV)
+        print("[*] Trying online search...")
+        query = ' '.join(args.terms)
+        online_results = search_online(query)
+        if online_results:
+            print(format_results(online_results, json_output=args.json))
+        else:
+            print("[!] Install exploitdb: apt install exploitdb")
+            print("[!] Or use --online flag for web search")
+
+
+if __name__ == '__main__':
+    main()

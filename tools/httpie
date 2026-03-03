@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""httpie - Simple and friendly HTTP client for the terminal."""
+
+import sys
+import json
+import argparse
+import requests
+from urllib.parse import urlparse
+import warnings
+warnings.filterwarnings('ignore')
+
+
+COLORS = {
+    'reset': '\033[0m',
+    'bold': '\033[1m',
+    'red': '\033[31m',
+    'green': '\033[32m',
+    'yellow': '\033[33m',
+    'blue': '\033[34m',
+    'magenta': '\033[35m',
+    'cyan': '\033[36m',
+    'gray': '\033[90m',
+}
+
+
+def colorize(text, color):
+    """Apply terminal color."""
+    if not sys.stdout.isatty():
+        return text
+    return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
+
+
+def format_headers(headers, color=True):
+    """Format HTTP headers for display."""
+    lines = []
+    for key, value in headers.items():
+        if color:
+            lines.append(f"{colorize(key, 'cyan')}: {value}")
+        else:
+            lines.append(f"{key}: {value}")
+    return '\n'.join(lines)
+
+
+def format_body(body, content_type=''):
+    """Format response body with optional pretty-printing."""
+    if 'json' in content_type:
+        try:
+            parsed = json.loads(body)
+            return json.dumps(parsed, indent=2, ensure_ascii=False)
+        except json.JSONDecodeError:
+            pass
+    return body
+
+
+def parse_items(items):
+    """Parse key=value and key:value items into headers and data."""
+    headers = {}
+    data = {}
+    params = {}
+    files = {}
+
+    for item in items:
+        if ':=' in item:
+            # JSON value
+            key, value = item.split(':=', 1)
+            try:
+                data[key] = json.loads(value)
+            except json.JSONDecodeError:
+                data[key] = value
+        elif '==' in item:
+            # Query parameter
+            key, value = item.split('==', 1)
+            params[key] = value
+        elif ':' in item and '/' not in item.split(':')[0]:
+            # Header
+            key, value = item.split(':', 1)
+            headers[key.strip()] = value.strip()
+        elif '=' in item:
+            # Data field
+            key, value = item.split('=', 1)
+            data[key] = value
+        elif '@' in item:
+            # File upload
+            key, path = item.split('@', 1)
+            files[key] = open(path, 'rb')
+
+    return headers, data, params, files
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Friendly HTTP client for the terminal',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  httpie GET http://example.com\n'
+               '  httpie POST http://api.example.com/data name=John age:=30\n'
+               '  httpie GET http://example.com q==search\n'
+               '  httpie PUT http://api.example.com/1 name=Updated Authorization:"Bearer tok"'
+    )
+    parser.add_argument('method', nargs='?', default='GET',
+                        help='HTTP method (GET, POST, PUT, DELETE, etc.)')
+    parser.add_argument('url', help='URL to request')
+    parser.add_argument('items', nargs='*',
+                        help='key=value (data), key:value (header), key==value (param), key:=value (JSON)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Show request headers too')
+    parser.add_argument('--headers', action='store_true', help='Show only response headers')
+    parser.add_argument('--body', action='store_true', help='Show only response body')
+    parser.add_argument('-f', '--form', action='store_true', help='Send as form data')
+    parser.add_argument('-j', '--json-mode', action='store_true', help='Force JSON content type')
+    parser.add_argument('--raw', metavar='DATA', help='Raw request body')
+    parser.add_argument('-o', '--output', help='Save response body to file')
+    parser.add_argument('-t', '--timeout', type=float, default=30, help='Timeout in seconds')
+    parser.add_argument('-k', '--insecure', action='store_true', help='Skip SSL verification')
+    parser.add_argument('-F', '--follow', action='store_true', help='Follow redirects')
+    parser.add_argument('--proxy', help='Proxy URL (e.g., http://127.0.0.1:8080)')
+    parser.add_argument('-A', '--auth', help='username:password for Basic Auth')
+    parser.add_argument('--user-agent', default='httpie-hexstrike/1.0',
+                        help='Custom User-Agent')
+    args = parser.parse_args()
+
+    # Fix URL if method is actually a URL
+    method = args.method.upper()
+    url = args.url
+    if '://' in method or '.' in method:
+        url = method
+        method = 'GET'
+
+    # Ensure scheme
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+
+    # Parse items
+    extra_headers, data, params, files = parse_items(args.items)
+
+    # Build request
+    req_headers = {'User-Agent': args.user_agent}
+    req_headers.update(extra_headers)
+
+    if data and not args.form and 'Content-Type' not in req_headers:
+        req_headers['Content-Type'] = 'application/json'
+
+    proxies = {'http': args.proxy, 'https': args.proxy} if args.proxy else None
+    auth = tuple(args.auth.split(':', 1)) if args.auth else None
+
+    try:
+        body = None
+        if args.raw:
+            body = args.raw
+        elif data:
+            if args.form:
+                body = data
+            else:
+                body = json.dumps(data)
+
+        resp = requests.request(
+            method, url,
+            headers=req_headers,
+            data=body if args.form or args.raw else None,
+            json=data if data and not args.form and not args.raw else None,
+            params=params or None,
+            files=files or None,
+            timeout=args.timeout,
+            verify=not args.insecure,
+            allow_redirects=args.follow,
+            proxies=proxies,
+            auth=auth,
+        )
+    except requests.exceptions.ConnectionError as e:
+        print(colorize(f"[!] Connection error: {e}", 'red'), file=sys.stderr)
+        sys.exit(1)
+    except requests.exceptions.Timeout:
+        print(colorize(f"[!] Request timed out after {args.timeout}s", 'red'), file=sys.stderr)
+        sys.exit(1)
+
+    # Output
+    if args.output:
+        with open(args.output, 'wb') as f:
+            f.write(resp.content)
+        print(f"Saved {len(resp.content)} bytes to {args.output}")
+        return
+
+    # Status line
+    status_color = 'green' if resp.status_code < 400 else 'red' if resp.status_code >= 500 else 'yellow'
+
+    if not args.body:
+        if args.verbose:
+            print(colorize(f"{method} {url}", 'bold'))
+            print(format_headers(req_headers))
+            print()
+
+        print(colorize(f"HTTP/{resp.raw.version / 10:.1f} {resp.status_code} {resp.reason}", status_color))
+        print(format_headers(resp.headers))
+
+    if not args.headers:
+        print()
+        content_type = resp.headers.get('Content-Type', '')
+        body_text = format_body(resp.text, content_type)
+        print(body_text)
+
+
+if __name__ == '__main__':
+    main()

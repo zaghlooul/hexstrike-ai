@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""api-schema-analyzer - Analyze OpenAPI/Swagger specifications for security issues."""
+
+import sys
+import json
+import argparse
+import re
+from urllib.parse import urlparse
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+
+SENSITIVE_PARAMS = [
+    'password', 'secret', 'token', 'key', 'api_key', 'apikey', 'auth',
+    'credential', 'private', 'ssn', 'credit_card', 'cc_number',
+]
+
+DANGEROUS_METHODS = ['delete', 'put', 'patch']
+
+AUTH_SCHEMES = {
+    'apiKey': 'API Key',
+    'http': 'HTTP Auth',
+    'oauth2': 'OAuth 2.0',
+    'openIdConnect': 'OpenID Connect',
+}
+
+
+def load_spec(source):
+    """Load API spec from file or URL."""
+    data = None
+
+    if source.startswith(('http://', 'https://')):
+        if not HAS_REQUESTS:
+            print("[!] requests library needed for URL loading", file=sys.stderr)
+            sys.exit(1)
+        resp = requests.get(source, timeout=15)
+        content = resp.text
+    else:
+        with open(source) as f:
+            content = f.read()
+
+    # Try JSON first
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    # Try YAML
+    if data is None and HAS_YAML:
+        try:
+            data = yaml.safe_load(content)
+        except yaml.YAMLError:
+            pass
+
+    if data is None:
+        print("[!] Could not parse spec as JSON or YAML", file=sys.stderr)
+        sys.exit(1)
+
+    return data
+
+
+def detect_version(spec):
+    """Detect OpenAPI/Swagger version."""
+    if 'openapi' in spec:
+        return f"OpenAPI {spec['openapi']}"
+    elif 'swagger' in spec:
+        return f"Swagger {spec['swagger']}"
+    return "Unknown"
+
+
+def analyze_security(spec):
+    """Analyze API spec for security issues."""
+    findings = {
+        'info': {},
+        'version': detect_version(spec),
+        'servers': [],
+        'endpoints': [],
+        'auth_schemes': [],
+        'vulnerabilities': [],
+        'stats': {
+            'total_endpoints': 0,
+            'methods': {},
+            'unprotected_endpoints': 0,
+            'sensitive_params': 0,
+        }
+    }
+
+    # Basic info
+    info = spec.get('info', {})
+    findings['info'] = {
+        'title': info.get('title', 'Unknown'),
+        'version': info.get('version', 'Unknown'),
+        'description': info.get('description', '')[:200],
+    }
+
+    # Servers
+    if 'servers' in spec:
+        for server in spec['servers']:
+            findings['servers'].append(server.get('url', ''))
+    elif 'host' in spec:
+        scheme = spec.get('schemes', ['https'])[0]
+        base = spec.get('basePath', '')
+        findings['servers'].append(f"{scheme}://{spec['host']}{base}")
+
+    # Check servers for HTTP (non-HTTPS)
+    for server_url in findings['servers']:
+        if server_url.startswith('http://'):
+            findings['vulnerabilities'].append({
+                'severity': 'HIGH',
+                'title': 'HTTP Server URL',
+                'description': f'Server uses unencrypted HTTP: {server_url}',
+                'endpoint': 'N/A',
+            })
+
+    # Security schemes
+    security_defs = (
+        spec.get('components', {}).get('securitySchemes', {}) or
+        spec.get('securityDefinitions', {})
+    )
+
+    for name, scheme in security_defs.items():
+        scheme_type = scheme.get('type', 'unknown')
+        findings['auth_schemes'].append({
+            'name': name,
+            'type': AUTH_SCHEMES.get(scheme_type, scheme_type),
+            'in': scheme.get('in', ''),
+            'scheme': scheme.get('scheme', ''),
+        })
+
+        # Check for API key in query string
+        if scheme_type == 'apiKey' and scheme.get('in') == 'query':
+            findings['vulnerabilities'].append({
+                'severity': 'MEDIUM',
+                'title': 'API Key in Query String',
+                'description': f'Security scheme "{name}" passes API key in URL query parameter. '
+                               'Keys may be logged in server logs and browser history.',
+                'endpoint': 'N/A',
+            })
+
+    # Global security
+    global_security = spec.get('security', [])
+
+    # Analyze paths
+    paths = spec.get('paths', {})
+    for path, methods in paths.items():
+        if not isinstance(methods, dict):
+            continue
+
+        for method, operation in methods.items():
+            if method.startswith('x-') or method == 'parameters':
+                continue
+            if not isinstance(operation, dict):
+                continue
+
+            findings['stats']['total_endpoints'] += 1
+            findings['stats']['methods'][method.upper()] = \
+                findings['stats']['methods'].get(method.upper(), 0) + 1
+
+            endpoint = {
+                'path': path,
+                'method': method.upper(),
+                'summary': operation.get('summary', ''),
+                'security': operation.get('security', global_security),
+                'parameters': [],
+                'issues': [],
+            }
+
+            # Check if endpoint has security
+            op_security = operation.get('security', global_security)
+            if not op_security or op_security == [{}]:
+                endpoint['issues'].append('No authentication required')
+                findings['stats']['unprotected_endpoints'] += 1
+                findings['vulnerabilities'].append({
+                    'severity': 'HIGH',
+                    'title': 'Unauthenticated Endpoint',
+                    'description': f'{method.upper()} {path} - No authentication required',
+                    'endpoint': f'{method.upper()} {path}',
+                })
+
+            # Analyze parameters
+            params = operation.get('parameters', [])
+            # Include path-level parameters
+            params.extend(methods.get('parameters', []))
+
+            for param in params:
+                if not isinstance(param, dict):
+                    continue
+                param_name = param.get('name', '')
+                param_in = param.get('in', '')
+                endpoint['parameters'].append({
+                    'name': param_name,
+                    'in': param_in,
+                    'required': param.get('required', False),
+                })
+
+                # Check for sensitive parameters
+                for sensitive in SENSITIVE_PARAMS:
+                    if sensitive in param_name.lower():
+                        findings['stats']['sensitive_params'] += 1
+                        if param_in == 'query':
+                            findings['vulnerabilities'].append({
+                                'severity': 'HIGH',
+                                'title': 'Sensitive Parameter in Query',
+                                'description': f'{method.upper()} {path} - '
+                                               f'Parameter "{param_name}" in query string',
+                                'endpoint': f'{method.upper()} {path}',
+                            })
+
+                # Check for potential injection points
+                schema = param.get('schema', {})
+                if schema.get('type') == 'string' and not schema.get('pattern') and not schema.get('enum'):
+                    if param_in in ('query', 'path'):
+                        endpoint['issues'].append(f'Unvalidated string param: {param_name}')
+
+            # Check request body
+            req_body = operation.get('requestBody', {})
+            if req_body:
+                content = req_body.get('content', {})
+                for content_type in content:
+                    if 'xml' in content_type:
+                        findings['vulnerabilities'].append({
+                            'severity': 'MEDIUM',
+                            'title': 'XML Content Type',
+                            'description': f'{method.upper()} {path} accepts XML. '
+                                           'Test for XXE injection.',
+                            'endpoint': f'{method.upper()} {path}',
+                        })
+
+            # Check for IDOR patterns
+            if re.search(r'\{.*id\}', path, re.I) or re.search(r'\{.*user\}', path, re.I):
+                if method.lower() in ('get', 'put', 'patch', 'delete'):
+                    endpoint['issues'].append('Potential IDOR - ID in path')
+
+            # Check dangerous methods without auth
+            if method.lower() in DANGEROUS_METHODS and (not op_security or op_security == [{}]):
+                findings['vulnerabilities'].append({
+                    'severity': 'CRITICAL',
+                    'title': f'Unprotected {method.upper()} Endpoint',
+                    'description': f'{method.upper()} {path} - Destructive method without authentication',
+                    'endpoint': f'{method.upper()} {path}',
+                })
+
+            findings['endpoints'].append(endpoint)
+
+    # Check for lack of rate limiting
+    has_rate_limit = False
+    for path, methods in paths.items():
+        for method, operation in methods.items():
+            if isinstance(operation, dict):
+                responses = operation.get('responses', {})
+                if '429' in responses:
+                    has_rate_limit = True
+                    break
+
+    if not has_rate_limit:
+        findings['vulnerabilities'].append({
+            'severity': 'MEDIUM',
+            'title': 'No Rate Limiting Documented',
+            'description': 'No 429 response code found in any endpoint. API may lack rate limiting.',
+            'endpoint': 'N/A',
+        })
+
+    # Check for CORS
+    has_cors = any(
+        'cors' in str(spec).lower()
+        for _ in [1]
+    )
+    if not has_cors:
+        findings['vulnerabilities'].append({
+            'severity': 'LOW',
+            'title': 'No CORS Configuration Documented',
+            'description': 'No CORS-related configuration found in spec. Test CORS settings manually.',
+            'endpoint': 'N/A',
+        })
+
+    return findings
+
+
+def format_findings(findings, json_output=False):
+    """Format analysis findings."""
+    if json_output:
+        return json.dumps(findings, indent=2)
+
+    lines = []
+    lines.append(f"\n{'=' * 70}")
+    lines.append(f"  API SCHEMA ANALYSIS")
+    lines.append(f"{'=' * 70}")
+    lines.append(f"  Title:    {findings['info']['title']}")
+    lines.append(f"  Version:  {findings['info']['version']}")
+    lines.append(f"  Spec:     {findings['version']}")
+
+    if findings['servers']:
+        lines.append(f"\n[SERVERS]")
+        for s in findings['servers']:
+            lines.append(f"  - {s}")
+
+    if findings['auth_schemes']:
+        lines.append(f"\n[AUTHENTICATION SCHEMES]")
+        for a in findings['auth_schemes']:
+            lines.append(f"  - {a['name']}: {a['type']} (in: {a['in'] or 'N/A'})")
+
+    stats = findings['stats']
+    lines.append(f"\n[STATISTICS]")
+    lines.append(f"  Total Endpoints:      {stats['total_endpoints']}")
+    lines.append(f"  Unprotected:          {stats['unprotected_endpoints']}")
+    lines.append(f"  Sensitive Parameters: {stats['sensitive_params']}")
+    lines.append(f"  Methods: {', '.join(f'{m}: {c}' for m, c in stats['methods'].items())}")
+
+    if findings['vulnerabilities']:
+        vulns_by_sev = {}
+        for v in findings['vulnerabilities']:
+            vulns_by_sev.setdefault(v['severity'], []).append(v)
+
+        lines.append(f"\n[VULNERABILITIES] ({len(findings['vulnerabilities'])} found)")
+        for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+            for v in vulns_by_sev.get(sev, []):
+                lines.append(f"  [{sev}] {v['title']}")
+                lines.append(f"    {v['description']}")
+
+    # Show endpoints summary
+    lines.append(f"\n[ENDPOINTS]")
+    for ep in findings['endpoints'][:30]:
+        issues = f" !! {', '.join(ep['issues'])}" if ep['issues'] else ""
+        lines.append(f"  {ep['method']:7s} {ep['path']}{issues}")
+
+    if len(findings['endpoints']) > 30:
+        lines.append(f"  ... and {len(findings['endpoints'])-30} more endpoints")
+
+    return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Analyze OpenAPI/Swagger specifications for security issues',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  api-schema-analyzer spec.json\n'
+               '  api-schema-analyzer https://api.example.com/openapi.json\n'
+               '  api-schema-analyzer swagger.yaml -j'
+    )
+    parser.add_argument('source', help='OpenAPI/Swagger spec file or URL')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('--endpoints-only', action='store_true', help='List endpoints only')
+    args = parser.parse_args()
+
+    spec = load_spec(args.source)
+    findings = analyze_security(spec)
+
+    if args.endpoints_only:
+        for ep in findings['endpoints']:
+            print(f"{ep['method']:7s} {ep['path']}")
+    else:
+        print(format_findings(findings, json_output=args.json))
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""qsreplace - Replace query string parameter values in URLs (stdin pipe tool)."""
+
+import sys
+import argparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+
+def replace_params(url, value, append=False):
+    """Replace all query string parameter values with the given value."""
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    new_params = {}
+    for key, vals in params.items():
+        if append:
+            new_params[key] = [v + value for v in vals]
+        else:
+            new_params[key] = [value] * len(vals)
+
+    new_query = urlencode(new_params, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Replace query string parameter values in URLs from stdin',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  cat urls.txt | qsreplace "FUZZ"\n'
+               '  cat urls.txt | qsreplace "<script>alert(1)</script>"\n'
+               '  cat urls.txt | qsreplace "1 OR 1=1" -a\n'
+               '  echo "http://example.com/?id=1&name=test" | qsreplace FUZZ'
+    )
+    parser.add_argument('value', help='Value to replace parameters with')
+    parser.add_argument('-a', '--append', action='store_true',
+                        help='Append to existing values instead of replacing')
+    parser.add_argument('-u', '--unique', action='store_true',
+                        help='Only output unique URL patterns (dedup by param structure)')
+    args = parser.parse_args()
+
+    seen = set()
+
+    for line in sys.stdin:
+        url = line.strip()
+        if not url:
+            continue
+
+        result = replace_params(url, args.value, args.append)
+
+        if args.unique:
+            parsed = urlparse(result)
+            pattern = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?" + \
+                      "&".join(sorted(parse_qs(parsed.query, keep_blank_values=True).keys()))
+            if pattern in seen:
+                continue
+            seen.add(pattern)
+
+        print(result)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""checksec - Check security properties of ELF binaries."""
+
+import sys
+import struct
+import argparse
+import json
+import os
+
+try:
+    from elftools.elf.elffile import ELFFile
+    from elftools.elf.segments import NoteSegment
+    from elftools.elf.dynamic import DynamicSection
+    HAS_PYELFTOOLS = True
+except ImportError:
+    HAS_PYELFTOOLS = False
+
+
+COLORS = {
+    'reset': '\033[0m', 'bold': '\033[1m',
+    'red': '\033[31m', 'green': '\033[32m', 'yellow': '\033[33m',
+}
+
+
+def color(text, c):
+    if not sys.stdout.isatty():
+        return text
+    return f"{COLORS.get(c, '')}{text}{COLORS['reset']}"
+
+
+def check_elf_security(filepath):
+    """Check security features of an ELF binary."""
+    results = {
+        'file': filepath,
+        'arch': '',
+        'relro': 'No RELRO',
+        'stack_canary': False,
+        'nx': False,
+        'pie': False,
+        'rpath': False,
+        'runpath': False,
+        'stripped': False,
+        'fortify': False,
+    }
+
+    with open(filepath, 'rb') as f:
+        # Check ELF magic
+        magic = f.read(4)
+        if magic != b'\x7fELF':
+            return None, "Not an ELF file"
+        f.seek(0)
+
+        if HAS_PYELFTOOLS:
+            return _check_with_pyelftools(f, results)
+        else:
+            return _check_manual(f, results)
+
+
+def _check_with_pyelftools(f, results):
+    """Check security using pyelftools."""
+    elf = ELFFile(f)
+
+    # Architecture
+    results['arch'] = elf.get_machine_arch()
+
+    # Check RELRO
+    has_relro = False
+    has_bind_now = False
+    for segment in elf.iter_segments():
+        if segment.header.p_type == 'PT_GNU_RELRO':
+            has_relro = True
+
+    # Check dynamic section
+    for section in elf.iter_sections():
+        if isinstance(section, DynamicSection):
+            for tag in section.iter_tags():
+                if tag.entry.d_tag == 'DT_BIND_NOW':
+                    has_bind_now = True
+                if tag.entry.d_tag == 'DT_FLAGS':
+                    if tag.entry.d_val & 0x8:  # DF_BIND_NOW
+                        has_bind_now = True
+                if tag.entry.d_tag == 'DT_FLAGS_1':
+                    if tag.entry.d_val & 0x1:  # DF_1_NOW
+                        has_bind_now = True
+                if tag.entry.d_tag == 'DT_RPATH':
+                    results['rpath'] = True
+                if tag.entry.d_tag == 'DT_RUNPATH':
+                    results['runpath'] = True
+
+    if has_relro and has_bind_now:
+        results['relro'] = 'Full RELRO'
+    elif has_relro:
+        results['relro'] = 'Partial RELRO'
+
+    # Check NX (Non-executable stack)
+    for segment in elf.iter_segments():
+        if segment.header.p_type == 'PT_GNU_STACK':
+            if not (segment.header.p_flags & 0x1):  # PF_X
+                results['nx'] = True
+
+    # Check PIE
+    if elf.header.e_type == 'ET_DYN':
+        results['pie'] = True
+
+    # Check stack canary
+    for section in elf.iter_sections():
+        if section.header.sh_type == 'SHT_DYNSYM':
+            from elftools.elf.sections import SymbolTableSection
+            if isinstance(section, SymbolTableSection):
+                for symbol in section.iter_symbols():
+                    if '__stack_chk_fail' in symbol.name:
+                        results['stack_canary'] = True
+                    if '_fortify' in symbol.name.lower() or '__fortified' in symbol.name.lower():
+                        results['fortify'] = True
+
+    # Check if stripped
+    results['stripped'] = not any(
+        section.header.sh_type == 'SHT_SYMTAB'
+        for section in elf.iter_sections()
+    )
+
+    return results, None
+
+
+def _check_manual(f, results):
+    """Fallback manual ELF parsing when pyelftools isn't available."""
+    f.seek(0)
+    data = f.read()
+
+    # Architecture from e_machine (offset 18 in header)
+    e_machine = struct.unpack_from('<H', data, 18)[0]
+    arch_map = {3: 'x86', 62: 'x86-64', 40: 'ARM', 183: 'AArch64', 8: 'MIPS'}
+    results['arch'] = arch_map.get(e_machine, f'Unknown({e_machine})')
+
+    # Check for symbols
+    if b'__stack_chk_fail' in data:
+        results['stack_canary'] = True
+    if b'_fortify' in data.lower() or b'__fortified' in data.lower():
+        results['fortify'] = True
+
+    # PIE: ET_DYN = 3
+    e_type = struct.unpack_from('<H', data, 16)[0]
+    if e_type == 3:
+        results['pie'] = True
+
+    return results, None
+
+
+def format_result(results, use_json=False):
+    """Format security check results."""
+    if use_json:
+        return json.dumps(results, indent=2)
+
+    lines = []
+    lines.append(f"\n{'=' * 60}")
+    lines.append(f"  CHECKSEC: {results['file']}")
+    lines.append(f"{'=' * 60}")
+    lines.append(f"  Arch:          {results['arch']}")
+
+    # RELRO
+    if results['relro'] == 'Full RELRO':
+        lines.append(f"  RELRO:         {color('Full RELRO', 'green')}")
+    elif results['relro'] == 'Partial RELRO':
+        lines.append(f"  RELRO:         {color('Partial RELRO', 'yellow')}")
+    else:
+        lines.append(f"  RELRO:         {color('No RELRO', 'red')}")
+
+    # Stack canary
+    if results['stack_canary']:
+        lines.append(f"  Stack Canary:  {color('Enabled', 'green')}")
+    else:
+        lines.append(f"  Stack Canary:  {color('Disabled', 'red')}")
+
+    # NX
+    if results['nx']:
+        lines.append(f"  NX:            {color('Enabled', 'green')}")
+    else:
+        lines.append(f"  NX:            {color('Disabled', 'red')}")
+
+    # PIE
+    if results['pie']:
+        lines.append(f"  PIE:           {color('Enabled', 'green')}")
+    else:
+        lines.append(f"  PIE:           {color('Disabled', 'red')}")
+
+    # RPATH / RUNPATH
+    if results['rpath']:
+        lines.append(f"  RPATH:         {color('Set (potential risk)', 'yellow')}")
+    if results['runpath']:
+        lines.append(f"  RUNPATH:       {color('Set (potential risk)', 'yellow')}")
+
+    # Fortify
+    if results['fortify']:
+        lines.append(f"  Fortify:       {color('Enabled', 'green')}")
+    else:
+        lines.append(f"  Fortify:       {color('Disabled', 'yellow')}")
+
+    # Stripped
+    if results['stripped']:
+        lines.append(f"  Symbols:       {color('Stripped', 'yellow')}")
+    else:
+        lines.append(f"  Symbols:       Not stripped")
+
+    return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Check security properties of ELF binaries',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  checksec /bin/ls\n'
+               '  checksec -j binary1 binary2\n'
+               '  checksec --dir /usr/bin/'
+    )
+    parser.add_argument('files', nargs='*', help='ELF binaries to check')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('--dir', help='Check all ELF files in directory')
+    args = parser.parse_args()
+
+    files = list(args.files)
+    if args.dir:
+        for entry in os.listdir(args.dir):
+            path = os.path.join(args.dir, entry)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                files.append(path)
+
+    if not files:
+        parser.print_help()
+        sys.exit(1)
+
+    all_results = []
+    for filepath in files:
+        if not os.path.exists(filepath):
+            print(f"[!] File not found: {filepath}", file=sys.stderr)
+            continue
+
+        results, error = check_elf_security(filepath)
+        if error:
+            print(f"[!] {filepath}: {error}", file=sys.stderr)
+            continue
+
+        all_results.append(results)
+
+    if args.json:
+        print(json.dumps(all_results if len(all_results) > 1 else all_results[0], indent=2))
+    else:
+        for r in all_results:
+            print(format_result(r))
+
+
+if __name__ == '__main__':
+    main()

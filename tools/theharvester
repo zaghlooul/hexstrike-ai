@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""theharvester - Email, subdomain, and information harvester."""
+
+import sys
+import json
+import re
+import argparse
+import requests
+from urllib.parse import urlparse, quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def search_crtsh(domain):
+    """Search crt.sh certificate transparency logs."""
+    results = {'subdomains': set(), 'emails': set()}
+    try:
+        resp = requests.get(
+            f"https://crt.sh/?q=%25.{domain}&output=json",
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            for entry in resp.json():
+                name = entry.get('name_value', '')
+                for sub in name.split('\n'):
+                    sub = sub.strip().lower()
+                    if sub.endswith(domain) and '*' not in sub:
+                        results['subdomains'].add(sub)
+    except Exception as e:
+        print(f"[!] crt.sh error: {e}", file=sys.stderr)
+    return results
+
+
+def search_hackertarget(domain):
+    """Search HackerTarget for subdomains."""
+    results = {'subdomains': set(), 'emails': set()}
+    try:
+        resp = requests.get(
+            f"https://api.hackertarget.com/hostsearch/?q={domain}",
+            timeout=15,
+        )
+        if resp.status_code == 200 and 'error' not in resp.text.lower():
+            for line in resp.text.strip().split('\n'):
+                parts = line.split(',')
+                if parts[0].endswith(domain):
+                    results['subdomains'].add(parts[0].strip().lower())
+    except Exception as e:
+        print(f"[!] HackerTarget error: {e}", file=sys.stderr)
+    return results
+
+
+def search_otx(domain):
+    """Search AlienVault OTX."""
+    results = {'subdomains': set(), 'emails': set()}
+    try:
+        resp = requests.get(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for entry in data.get('passive_dns', []):
+                hostname = entry.get('hostname', '').lower()
+                if hostname.endswith(domain):
+                    results['subdomains'].add(hostname)
+    except Exception as e:
+        print(f"[!] OTX error: {e}", file=sys.stderr)
+    return results
+
+
+def search_rapiddns(domain):
+    """Search RapidDNS for subdomains."""
+    results = {'subdomains': set(), 'emails': set()}
+    try:
+        resp = requests.get(
+            f"https://rapiddns.io/subdomain/{domain}?full=1",
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            # Extract subdomains from HTML table
+            for match in re.finditer(r'<td>([a-zA-Z0-9._-]+\.' + re.escape(domain) + r')</td>', resp.text):
+                results['subdomains'].add(match.group(1).lower())
+    except Exception as e:
+        print(f"[!] RapidDNS error: {e}", file=sys.stderr)
+    return results
+
+
+def search_urlscan(domain):
+    """Search URLScan.io for subdomains."""
+    results = {'subdomains': set(), 'emails': set()}
+    try:
+        resp = requests.get(
+            f"https://urlscan.io/api/v1/search/?q=domain:{domain}&size=100",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for entry in resp.json().get('results', []):
+                page = entry.get('page', {})
+                page_domain = page.get('domain', '').lower()
+                if page_domain.endswith(domain):
+                    results['subdomains'].add(page_domain)
+    except Exception as e:
+        print(f"[!] URLScan error: {e}", file=sys.stderr)
+    return results
+
+
+def search_anubis(domain):
+    """Search Anubis DB for subdomains."""
+    results = {'subdomains': set(), 'emails': set()}
+    try:
+        resp = requests.get(
+            f"https://jldc.me/anubis/subdomains/{domain}",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for sub in resp.json():
+                if sub.endswith(domain):
+                    results['subdomains'].add(sub.lower())
+    except Exception as e:
+        print(f"[!] Anubis error: {e}", file=sys.stderr)
+    return results
+
+
+def search_web_emails(domain):
+    """Search web pages for email addresses."""
+    results = {'subdomains': set(), 'emails': set()}
+    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@' + re.escape(domain), re.I)
+
+    search_urls = [
+        f"https://www.google.com/search?q=%22@{domain}%22&num=50",
+        f"https://www.bing.com/search?q=%22@{domain}%22&count=50",
+    ]
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0',
+    }
+
+    for search_url in search_urls:
+        try:
+            resp = requests.get(search_url, headers=headers, timeout=15)
+            for email in email_pattern.findall(resp.text):
+                results['emails'].add(email.lower())
+        except Exception:
+            pass
+
+    return results
+
+
+def resolve_subdomain(subdomain):
+    """Resolve a subdomain to IP addresses."""
+    import socket
+    try:
+        ips = socket.getaddrinfo(subdomain, None)
+        return list(set(addr[4][0] for addr in ips))
+    except socket.gaierror:
+        return []
+
+
+SOURCES = {
+    'crt.sh': search_crtsh,
+    'HackerTarget': search_hackertarget,
+    'OTX': search_otx,
+    'RapidDNS': search_rapiddns,
+    'URLScan': search_urlscan,
+    'Anubis': search_anubis,
+    'Web Emails': search_web_emails,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Email, subdomain, and information harvester',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples:\n'
+               '  theharvester -d example.com\n'
+               '  theharvester -d example.com -b crt.sh,otx\n'
+               '  theharvester -d example.com --resolve\n'
+               '  theharvester -d example.com -j -o results.json'
+    )
+    parser.add_argument('-d', '--domain', required=True, help='Target domain')
+    parser.add_argument('-b', '--sources', help='Comma-separated sources (default: all)')
+    parser.add_argument('--resolve', action='store_true', help='Resolve subdomains to IPs')
+    parser.add_argument('-t', '--threads', type=int, default=10, help='Threads (default: 10)')
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+    parser.add_argument('-o', '--output', help='Output file')
+    parser.add_argument('--email-only', action='store_true', help='Only search for emails')
+    parser.add_argument('--subs-only', action='store_true', help='Only search for subdomains')
+    args = parser.parse_args()
+
+    domain = args.domain.replace('https://', '').replace('http://', '').strip('/')
+
+    # Select sources
+    if args.sources:
+        selected = [s.strip().lower() for s in args.sources.split(',')]
+        sources = {k: v for k, v in SOURCES.items() if k.lower() in selected}
+    else:
+        sources = SOURCES
+
+    print(f"[*] Target: {domain}")
+    print(f"[*] Sources: {', '.join(sources.keys())}")
+
+    all_subdomains = set()
+    all_emails = set()
+
+    # Run sources in parallel
+    with ThreadPoolExecutor(max_workers=len(sources)) as executor:
+        futures = {
+            executor.submit(func, domain): name
+            for name, func in sources.items()
+        }
+
+        for future in as_completed(futures):
+            source_name = futures[future]
+            try:
+                result = future.result()
+                subs = result.get('subdomains', set())
+                emails = result.get('emails', set())
+                all_subdomains.update(subs)
+                all_emails.update(emails)
+                print(f"[+] {source_name}: {len(subs)} subdomains, {len(emails)} emails")
+            except Exception as e:
+                print(f"[!] {source_name} failed: {e}")
+
+    # Resolve subdomains
+    resolved = {}
+    if args.resolve and all_subdomains:
+        print(f"[*] Resolving {len(all_subdomains)} subdomains...")
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            futures = {
+                executor.submit(resolve_subdomain, sub): sub
+                for sub in all_subdomains
+            }
+            for future in as_completed(futures):
+                sub = futures[future]
+                ips = future.result()
+                if ips:
+                    resolved[sub] = ips
+
+    # Output
+    result_data = {
+        'domain': domain,
+        'subdomains': sorted(all_subdomains),
+        'emails': sorted(all_emails),
+        'total_subdomains': len(all_subdomains),
+        'total_emails': len(all_emails),
+    }
+    if args.resolve:
+        result_data['resolved'] = resolved
+
+    if args.json:
+        output = json.dumps(result_data, indent=2)
+        if args.output:
+            with open(args.output, 'w') as f:
+                f.write(output)
+            print(f"\n[+] Saved to {args.output}")
+        else:
+            print(output)
+    else:
+        if not args.email_only:
+            print(f"\n{'=' * 60}")
+            print(f"  SUBDOMAINS ({len(all_subdomains)} found)")
+            print(f"{'=' * 60}")
+            for sub in sorted(all_subdomains):
+                if args.resolve and sub in resolved:
+                    print(f"  {sub} -> {', '.join(resolved[sub])}")
+                else:
+                    print(f"  {sub}")
+
+        if not args.subs_only:
+            print(f"\n{'=' * 60}")
+            print(f"  EMAILS ({len(all_emails)} found)")
+            print(f"{'=' * 60}")
+            for email in sorted(all_emails):
+                print(f"  {email}")
+
+        if args.output:
+            with open(args.output, 'w') as f:
+                if not args.email_only:
+                    for sub in sorted(all_subdomains):
+                        f.write(sub + '\n')
+                if not args.subs_only:
+                    for email in sorted(all_emails):
+                        f.write(email + '\n')
+            print(f"\n[+] Saved to {args.output}")
+
+    print(f"\n[*] Total: {len(all_subdomains)} subdomains, {len(all_emails)} emails")
+
+
+if __name__ == '__main__':
+    main()
